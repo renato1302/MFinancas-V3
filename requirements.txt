@@ -1,0 +1,7 @@
+streamlit
+pandas
+plotly
+utils
+supabase
+postgrest
+yfinance
