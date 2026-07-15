@@ -14,9 +14,14 @@ def render_lancamentos():
     # 1. Recupera o usuário logado na sessão (Essencial para o Supabase)
     usuario_atual = st.session_state.get('username')
 
-    # 2. AJUSTE SUPABASE: Buscamos as configurações específicas do usuário
-    df_contas = buscar_contas(usuario_atual)
-    df_cats = buscar_categorias(usuario_atual)
+    # 2. BUSCA MULTI-USUÁRIO: Traz tanto a estrutura padrão (admin) quanto a do próprio usuário
+    df_contas_admin = buscar_contas("admin")  # Garanta que seu usuário admin principal se chama exatamente "admin"
+    df_contas_user = buscar_contas(usuario_atual) if usuario_atual != "admin" else pd.DataFrame()
+    df_contas = pd.concat([df_contas_admin, df_contas_user]).drop_duplicates(subset=['nome'])
+
+    df_cats_admin = buscar_categorias("admin")
+    df_cats_user = buscar_categorias(usuario_atual) if usuario_atual != "admin" else pd.DataFrame()
+    df_cats = pd.concat([df_cats_admin, df_cats_user]).drop_duplicates(subset=['grupo', 'subgrupo', 'subcategoria'])
 
     # 3. Validação de segurança
     if df_contas.empty or df_cats.empty:
