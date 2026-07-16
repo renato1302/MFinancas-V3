@@ -1,183 +1,202 @@
-import duckdb
+import streamlit as st
+from supabase import create_client, Client
 import pandas as pd
-import hashlib
+import hashlib  # <--- ESSENCIAL PARA O HASH_PASSWORD FUNCIONAR
+
+
+# 1. Conexão com o Supabase usando os Secrets que você criou
+url: str = st.secrets["SUPABASE_URL"]
+key: str = st.secrets["SUPABASE_KEY"]
+supabase: Client = create_client(url, key)
+
+def get_supabase():
+    """Retorna a instância do cliente Supabase."""
+    return supabase
+
+# --- FUNÇÕES DE USUÁRIOS ---
+
+def buscar_usuario(username):
+    """Busca um usuário no banco de dados do Supabase."""
+    response = supabase.table("usuarios").select("*").eq("username", username).execute()
+    return response.data[0] if response.data else None
+
+def criar_usuario(username, senha, email, nivel="Usuário"):
+    """Cria um novo usuário na nuvem."""
+    dados = {
+        "username": username,
+        "senha": senha,
+        "email": email,
+        "nivel": nivel,
+        "aprovado": False
+    }
+    return supabase.table("usuarios").insert(dados).execute()
 
 
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
 
-def init_db():
-    conn = duckdb.connect('financas.db')
-
-    # Criamos a sequência para o ID se não existir
-    conn.execute("CREATE SEQUENCE IF NOT EXISTS seq_transacoes START 1")
-    # Criamos a sequência para o ID de investimentos
-    conn.execute("CREATE SEQUENCE IF NOT EXISTS seq_invest START 1")
-
-    # 1. TABELA DE TRANSAÇÕES (Atualizada com campo 'username')
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS transacoes (
-            id INTEGER PRIMARY KEY DEFAULT nextval('seq_transacoes'),
-            valor FLOAT, 
-            tipo TEXT, 
-            grupo TEXT, 
-            subgrupo TEXT, 
-            subcategoria TEXT,
-            conta TEXT, 
-            data DATE, 
-            pago BOOLEAN, 
-            recorrente BOOLEAN, 
-            descricao TEXT,
-            id_agrupador TEXT,
-            username TEXT  -- Nova coluna para multiusuário
-        )
-    """)
-
-    # 1.1 TABELA DE INVESTIMENTOS (Adicionada para corrigir o erro de ID)
-    conn.execute("""
-            CREATE TABLE IF NOT EXISTS transacoes_invest (
-                id INTEGER PRIMARY KEY DEFAULT nextval('seq_invest'),
-                ativo TEXT,
-                quantidade FLOAT,
-                valor_unitario FLOAT,
-                data DATE,
-                tipo_operacao TEXT, -- Compra ou Venda
-                corretora TEXT,
-                username TEXT
-            )
-        """)
-
-    # MIRAÇÃO AUTOMÁTICA: Se a tabela já existia sem a coluna username, adicionamos agora
-    cols = conn.execute("PRAGMA table_info('transacoes')").fetchall()
-    if 'username' not in [c[1] for c in cols]:
-        conn.execute("ALTER TABLE transacoes ADD COLUMN username TEXT")
-        # Atribuímos os dados antigos ao 'admin' para não perder nada
-        conn.execute("UPDATE transacoes SET username = 'admin' WHERE username IS NULL")
-
-    # 2. TABELA DE CATEGORIAS (Global - Admin gerencia para todos)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS cad_categorias (
-            grupo TEXT, subgrupo TEXT, subcategoria TEXT, 
-            permite_split BOOLEAN DEFAULT FALSE,
-            PRIMARY KEY (grupo, subgrupo, subcategoria)
-        )
-    """)
-
-    # 3. TABELA DE CONTAS (Global - Admin gerencia para todos)
-    conn.execute("CREATE TABLE IF NOT EXISTS cad_contas (nome TEXT PRIMARY KEY, tipo TEXT, vencimento TEXT)")
-
-    # 4. TABELA DE USUÁRIOS
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS usuarios (
-            username TEXT PRIMARY KEY, 
-            senha TEXT, 
-            email TEXT, 
-            nivel TEXT, 
-            aprovado BOOLEAN DEFAULT FALSE
-        )
-    """)
-
-
-    # Criar admin padrão se não existir
-    admin_exists = conn.execute("SELECT * FROM usuarios WHERE username = 'admin'").fetchone()
-    if not admin_exists:
-        conn.execute("INSERT INTO usuarios VALUES (?, ?, ?, ?, ?)",
-                     ('admin', hash_password('admin123'), 'admin@email.com', 'Administrador', True))
-
-    conn.close()
-
-
-
-def executar_query(sql, params=()):
-    conn = duckdb.connect('financas.db')
-    try:
-        conn.execute(sql, params)
-    finally:
-        conn.close()
-
-
-def ler_dados(tabela):
-    """Lê tabelas globais (categorias, contas, usuários)"""
-    conn = duckdb.connect('financas.db')
-    try:
-        df = conn.execute(f"SELECT * FROM {tabela}").df()
-    finally:
-        conn.close()
-    return df
-
-
 def carregar_dados(username=None):
-    """
-    Lê as transações filtrando por usuário.
-    Se for Admin, você pode optar por ver tudo ou apenas o seu.
-    """
-    conn = duckdb.connect('financas.db')
-    try:
-        if username:
-            query = "SELECT * FROM transacoes WHERE username = ? ORDER BY data DESC"
-            df = conn.execute(query, (username,)).df()
-        else:
-            # Caso queira ver tudo (uso administrativo)
-            df = conn.execute("SELECT * FROM transacoes ORDER BY data DESC").df()
-    finally:
-        conn.close()
+    """Lê as transações do Supabase filtrando por usuario_id."""
+    query = supabase.table("transacoes").select("*")
+
+    if username:
+        # TROQUE 'username' por 'usuario_id' aqui:
+        query = query.eq("username", username)
+
+    response = query.order("data", desc=True).execute()
+    df = pd.DataFrame(response.data)
 
     if not df.empty:
         df['data'] = pd.to_datetime(df['data'])
+
     return df
 
 
-def get_saldo_por_conta(nome_conta, username):
-    """Retorna o saldo de uma conta específica para um usuário específico."""
-    conn = duckdb.connect('financas.db')
+def inserir_transacao(dados):
+    """Salva uma nova transação no Supabase."""
     try:
-        res = conn.execute("""
-            SELECT COALESCE(SUM(valor), 0.0) 
-            FROM transacoes 
-            WHERE conta = ? AND username = ?
-        """, (nome_conta, username)).fetchone()[0]
-    finally:
-        conn.close()
-    return float(res)
+        # Se o dicionário que vem da View usa 'usuario_id',
+        # vamos garantir que ele vire 'username' antes de enviar
+        if 'usuario_id' in dados:
+            dados['username'] = dados.pop('usuario_id')
+
+        response = supabase.table("transacoes").insert(dados).execute()
+        return response
+    except Exception as e:
+        st.error(f"Erro ao salvar no Supabase: {e}")
+        return None
+
+def carregar_dados_config(tabela, username):
+    """
+    Busca dados de tabelas de configuração (cad_contas, cad_categorias)
+    filtrando pelo dono da conta.
+    """
+    try:
+        response = supabase.table(tabela).select("*").eq("username", username).execute()
+        return pd.DataFrame(response.data)
+    except Exception as e:
+        print(f"Erro ao carregar {tabela}: {e}")
+        return pd.DataFrame()
+
+def get_saldo_por_conta(nome_conta, username):
+    """Retorna o saldo de uma conta específica para um usuário no Supabase."""
+    # 1. Buscamos na tabela 'transacoes'
+    # 2. Selecionamos apenas a coluna 'valor' (para ser mais rápido)
+    # 3. Filtramos pela conta E pelo username
+    response = supabase.table("transacoes") \
+        .select("valor") \
+        .eq("conta", nome_conta) \
+        .eq("username", username) \
+        .execute()
+
+    # 4. Somamos os valores que voltaram na lista
+    lista_valores = [item['valor'] for item in response.data]
+    return float(sum(lista_valores)) if lista_valores else 0.0
 
 
 def get_saldo_por_tipo(tipo_conta, username):
-    """Soma o saldo de tipos de conta (ex: Investimento) para o usuário logado."""
-    conn = duckdb.connect('financas.db')
-    try:
-        contas = conn.execute("SELECT nome FROM cad_contas WHERE tipo = ?", (tipo_conta,)).fetchall()
-        nomes_contas = [c[0] for c in contas]
+    """Soma o saldo de tipos de conta (ex: Investimento) para o usuário logado no Supabase."""
+    # 1. Primeiro, descobrimos quais contas pertencem a esse 'tipo' (ex: 'Investimento')
+    # Buscamos na tabela 'cad_contas' (que você deve ter criado no SQL Editor)
+    res_contas = supabase.table("cad_contas") \
+        .select("nome") \
+        .eq("tipo", tipo_conta) \
+        .execute()
 
-        if not nomes_contas:
-            return 0.0
+    nomes_contas = [c['nome'] for c in res_contas.data]
 
-        placeholder = ', '.join(['?'] * len(nomes_contas))
-        query = f"""
-            SELECT COALESCE(SUM(valor), 0.0) 
-            FROM transacoes 
-            WHERE username = ? AND conta IN ({placeholder})
-        """
-        params = [username] + nomes_contas
-        res = conn.execute(query, params).fetchone()[0]
-    finally:
-        conn.close()
-    return float(res)
+    # 2. Se não houver nenhuma conta desse tipo cadastrada, o saldo é zero
+    if not nomes_contas:
+        return 0.0
+
+    # 3. Agora buscamos a soma dos valores na tabela 'transacoes'
+    # O filtro '.in_("coluna", lista)' substitui aquele 'IN (?, ?, ?)' do SQL
+    response = supabase.table("transacoes") \
+        .select("valor") \
+        .eq("username", username) \
+        .in_("conta", nomes_contas) \
+        .execute()
+
+    # 4. Somamos os valores retornados
+    valores = [item['valor'] for item in response.data]
+    return float(sum(valores)) if valores else 0.0
 
 
 def get_resumo_patrimonio(username):
-    """Retorna o resumo financeiro filtrado pelo usuário."""
+    """Retorna o resumo financeiro do Supabase filtrado pelo usuário logado."""
+
+    # 1. Busca os saldos específicos usando as funções que já adaptamos
     saldo_liquidez = get_saldo_por_tipo('Investimento (Liquidez)', username)
     saldo_contas = get_saldo_por_tipo('Conta Corrente', username)
-    # Soma de ganhos e gastos totais para o dashboard
+
+    # 2. Carrega todas as transações do usuário (da nuvem) para calcular totais
     df = carregar_dados(username)
 
-    ganhos = df[df['valor'] > 0]['valor'].sum() if not df.empty else 0.0
-    gastos = df[df['valor'] < 0]['valor'].sum() if not df.empty else 0.0
+    # 3. Cálculos matemáticos (isso o Pandas faz na memória, não depende do banco)
+    if not df.empty:
+        ganhos = df[df['valor'] > 0]['valor'].sum()
+        gastos = df[df['valor'] < 0]['valor'].sum()
+    else:
+        ganhos = 0.0
+        gastos = 0.0
 
+    # 4. Retorna o dicionário que alimenta os cartões do seu Dashboard
     return {
-        "Disponível": saldo_liquidez + saldo_contas,
-        "Ganhos": ganhos,
-        "Gastos": abs(gastos),
-        "Investido": saldo_liquidez
+        "Disponível": float(saldo_liquidez + saldo_contas),
+        "Ganhos": float(ganhos),
+        "Gastos": float(abs(gastos)),
+        "Investido": float(saldo_liquidez)
     }
+
+def salvar_transacao(dados):
+    """
+    Envia uma nova transação (dicionário) para a tabela no Supabase.
+    """
+    # No Supabase, basta passar o dicionário diretamente para o .insert()
+    # Ele deve conter as chaves: valor, tipo, grupo, subgrupo, conta, data, username, etc.
+    try:
+        response = supabase.table("transacoes").insert(dados).execute()
+        return response
+    except Exception as e:
+        st.error(f"Erro ao salvar no Supabase: {e}")
+        return None
+
+def buscar_categorias(username):
+    """Busca as categorias cadastradas na nuvem filtrando pelo usuário."""
+    try:
+        response = supabase.table("cad_categorias") \
+            .select("*") \
+            .eq("username", username) \
+            .execute()
+        return pd.DataFrame(response.data)
+    except Exception as e:
+        print(f"Erro ao buscar categorias: {e}")
+        return pd.DataFrame()
+
+def buscar_contas(username):
+    """Busca as contas cadastradas na nuvem filtrando pelo usuário."""
+    try:
+        response = supabase.table("cad_contas") \
+            .select("*") \
+            .eq("username", username) \
+            .execute()
+        return pd.DataFrame(response.data)
+    except Exception as e:
+        print(f"Erro ao buscar contas: {e}")
+        return pd.DataFrame()
+
+def carregar_transacoes_invest(username):
+    """Busca as transações de investimento do Supabase"""
+    try:
+        # Tabela real: transacoes_invest
+        # Coluna real: data
+        response = supabase.table("transacoes_invest") \
+            .select("*") \
+            .eq("usuario_id", username) \
+            .order("data", desc=True) \
+            .execute()
+        return pd.DataFrame(response.data)
+    except Exception as e:
+        print(f"Erro ao carregar transações de invest: {e}")
+        return pd.DataFrame()

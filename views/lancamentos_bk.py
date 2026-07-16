@@ -14,9 +14,14 @@ def render_lancamentos():
     # 1. Recupera o usuário logado na sessão (Essencial para o Supabase)
     usuario_atual = st.session_state.get('username')
 
-    # 2. AJUSTE SUPABASE: Buscamos as configurações específicas do usuário
-    df_contas = buscar_contas(usuario_atual)
-    df_cats = buscar_categorias(usuario_atual)
+    # 2. BUSCA MULTI-USUÁRIO: Traz tanto a estrutura padrão (admin) quanto a do próprio usuário
+    df_contas_admin = buscar_contas("admin")  # Garanta que seu usuário admin principal se chama exatamente "admin"
+    df_contas_user = buscar_contas(usuario_atual) if usuario_atual != "admin" else pd.DataFrame()
+    df_contas = pd.concat([df_contas_admin, df_contas_user]).drop_duplicates(subset=['nome'])
+
+    df_cats_admin = buscar_categorias("admin")
+    df_cats_user = buscar_categorias(usuario_atual) if usuario_atual != "admin" else pd.DataFrame()
+    df_cats = pd.concat([df_cats_admin, df_cats_user]).drop_duplicates(subset=['grupo', 'subgrupo', 'subcategoria'])
 
     # 3. Validação de segurança
     if df_contas.empty or df_cats.empty:
@@ -50,11 +55,13 @@ def render_lancamentos():
                     grupo_sel = st.selectbox("Grupo", lista_grupos, key="new_grupo")
 
                 with c2:
+                    # FILTRAGEM DINÂMICA: Subgrupos dependem exclusivamente do Grupo selecionado
                     sub_opts = df_cats[df_cats['grupo'] == grupo_sel]['subgrupo'].unique()
                     sub_opts_sorted = sorted(sub_opts) if len(sub_opts) > 0 else ["Padrão"]
                     subgrupo_sel = st.selectbox("Subgrupo", sub_opts_sorted, key="new_subgrupo")
 
                 with c3:
+                    # FILTRAGEM DINÂMICA: Subcategorias dependem do Grupo AND Subgrupo selecionados
                     filtro_subcat = (df_cats['grupo'] == grupo_sel) & (df_cats['subgrupo'] == subgrupo_sel)
                     subcat_opts = df_cats[filtro_subcat]['subcategoria'].unique()
                     subcat_opts_sorted = sorted(subcat_opts) if len(subcat_opts) > 0 else ["Padrão"]
@@ -102,7 +109,7 @@ def render_lancamentos():
 
                 st.write(f"Soma: **R$ {soma_atual:.2f}** | Restante: **R$ {diferenca:.2f}**")
 
-                if st.button("🚀 Confirmar Lançamento Desmembrado", type="primary", use_container_width=True):
+                if st.button("🚀 Confirmar Lançamento Desmembrado", type="primary", width='stretch'):
                     if abs(diferenca) > 0.01:
                         st.error("A soma das subcategorias não bate com o valor total.")
                     elif valor_input <= 0:
@@ -142,7 +149,7 @@ def render_lancamentos():
                             st.error(f"Erro ao salvar split: {e}")
 
             else:
-                if st.button("🚀 Confirmar Lançamento", type="primary", use_container_width=True):
+                if st.button("🚀 Confirmar Lançamento", type="primary", width='stretch'):
                     if valor_input > 0:
                         try:
                             if tipo == "Transferência":
@@ -237,7 +244,7 @@ def render_lancamentos():
                     sel_col_val = col_val.selectbox("Coluna do Valor", colunas, index=idx_val)
 
                     # Evento do Botão de Processamento
-                    if st.button("🧠 Ler Arquivo e Aplicar IA", use_container_width=True):
+                    if st.button("🧠 Ler Arquivo e Aplicar IA", width='stretch'):
                         arquivo_csv.seek(0)
                         df_completo = pd.read_csv(arquivo_csv)
 
@@ -348,7 +355,7 @@ def render_lancamentos():
                 st.info(
                     "💡 Linhas marcadas como 'Já Existe (Duplicado)' vêm desmarcadas por padrão. Ative a caixa se quiser forçar o lançamento.")
 
-                # Listas de opções para preencher o grid interativo
+                # Listas de opções globais para preencher o grid interativo
                 grupos_cadastrados = sorted(list(df_cats['grupo'].unique()))
                 subgrupos_cadastrados = sorted(list(df_cats['subgrupo'].unique()))
                 subcat_cadastradas = sorted(list(df_cats['subcategoria'].unique()))
@@ -356,7 +363,7 @@ def render_lancamentos():
                 # Data Editor interativo
                 df_ajustado = st.data_editor(
                     df_atual,
-                    use_container_width=True,
+                    width='stretch',
                     hide_index=True,
                     column_config={
                         "Importar": st.column_config.CheckboxColumn("Importar?", help="Selecione as que deseja salvar"),
@@ -379,7 +386,7 @@ def render_lancamentos():
 
                 col_b1, col_b2 = st.columns(2)
 
-                if col_b1.button("💾 Confirmar Lançamentos no Banco", type="primary", use_container_width=True):
+                if col_b1.button("💾 Confirmar Lançamentos no Banco", type="primary", width='stretch'):
                     # Filtra apenas o que o usuário escolheu importar na coluna "Importar"
                     if "Importar" in df_ajustado.columns:
                         df_para_salvar = df_ajustado[df_ajustado["Importar"] == True]
@@ -391,44 +398,58 @@ def render_lancamentos():
                     else:
                         sucesso_importacao = True
                         transacoes_para_salvar = []
+                        validacao_ok = True
 
-                        with st.spinner("Inserindo transações no banco..."):
-                            for _, row in df_para_salvar.iterrows():
-                                valor_real = -abs(row["Valor (R$)"]) if row["Tipo"] == "Gasto" else abs(
-                                    row["Valor (R$)"])
+                        # VALIDAÇÃO DE INTEGRIDADE ANTES DE SALVAR (IMPEDE RELAÇÕES ERRADAS NA IMPORTAÇÃO)
+                        for idx, row in df_para_salvar.iterrows():
+                            relacao_valida = df_cats[
+                                (df_cats['grupo'] == row["Grupo"]) &
+                                (df_cats['subgrupo'] == row["Subgrupo"]) &
+                                (df_cats['subcategoria'] == row["Subcategoria"])
+                            ]
+                            if relacao_valida.empty:
+                                st.error(f"❌ Erro na linha de Descrição '{row['Descrição']}': A combinação Grupo '{row['Grupo']}' ➔ Subgrupo '{row['Subgrupo']}' ➔ Subcategoria '{row['Subcategoria']}' não existe nas suas configurações!")
+                                validacao_ok = False
+                                break
 
-                                dados_lanc = {
-                                    "valor": valor_real,
-                                    "tipo": row["Tipo"],
-                                    "grupo": row["Grupo"],
-                                    "subgrupo": row["Subgrupo"],
-                                    "subcategoria": row["Subcategoria"],
-                                    "conta": import_conta_sel,
-                                    "data": row["Data"],
-                                    "descricao": row["Descrição"],
-                                    "usuario_id": usuario_atual
-                                }
+                        if validacao_ok:
+                            with st.spinner("Inserindo transações no banco..."):
+                                for _, row in df_para_salvar.iterrows():
+                                    valor_real = -abs(row["Valor (R$)"]) if row["Tipo"] == "Gasto" else abs(
+                                        row["Valor (R$)"])
 
-                                if not inserir_transacao(dados_lanc):
-                                    sucesso_importacao = False
-                                else:
-                                    transacoes_para_salvar.append(dados_lanc)
+                                    dados_lanc = {
+                                        "valor": valor_real,
+                                        "tipo": row["Tipo"],
+                                        "grupo": row["Grupo"],
+                                        "subgrupo": row["Subgrupo"],
+                                        "subcategoria": row["Subcategoria"],
+                                        "conta": import_conta_sel,
+                                        "data": row["Data"],
+                                        "descricao": row["Descrição"],
+                                        "usuario_id": usuario_atual
+                                    }
 
-                        if sucesso_importacao:
-                            # Ensina a IA com os dados revisados e inseridos com sucesso
-                            treinar_sistema(transacoes_para_salvar, usuario_atual)
+                                    if not inserir_transacao(dados_lanc):
+                                        sucesso_importacao = False
+                                    else:
+                                        transacoes_para_salvar.append(dados_lanc)
 
-                            st.success(
-                                f"✅ Sucesso! {len(transacoes_para_salvar)} lançamentos importados e a inteligência foi treinada.")
+                            if sucesso_importacao:
+                                # Ensina a IA com os dados revisados e inseridos com sucesso
+                                treinar_sistema(transacoes_para_salvar, usuario_atual)
 
-                            # Limpa os estados da sessão para voltar ao layout inicial limpo de forma segura
-                            st.session_state.pop("df_importacao_previa", None)
-                            st.session_state.pop("import_concluida", None)
-                            st.rerun()
-                        else:
-                            st.error("Houve um erro ao processar alguns registros no Supabase.")
+                                st.success(
+                                    f"✅ Sucesso! {len(transacoes_para_salvar)} lançamentos importados e a inteligência foi treinada.")
 
-                if col_b2.button("❌ Cancelar Importação", use_container_width=True):
+                                # Limpa os estados da sessão para voltar ao layout inicial limpo de forma segura
+                                st.session_state.pop("df_importacao_previa", None)
+                                st.session_state.pop("import_concluida", None)
+                                st.rerun()
+                            else:
+                                st.error("Houve um erro ao processar alguns registros no Supabase.")
+
+                if col_b2.button("❌ Cancelar Importação", width='stretch'):
                     st.session_state.pop("df_importacao_previa", None)
                     st.session_state.pop("import_concluida", None)
                     st.rerun()
@@ -474,7 +495,7 @@ def render_lancamentos():
         # Exibe o data editor
         df_ajustado_recentes = st.data_editor(
             df_editavel,
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
             column_config={
                 "id": st.column_config.TextColumn("ID", disabled=True),
@@ -491,59 +512,94 @@ def render_lancamentos():
             key="editor_recentes_automatico"
         )
 
-        # Botão para salvar alterações em massa feitas na tabela
-        if st.button("💾 Salvar Alterações e Treinar IA", type="primary", use_container_width=True):
-            # Identifica apenas as linhas que foram alteradas comparando o DataFrame original com o editado
+        # ==========================================
+        # MODIFICAÇÃO AQUI: SALVAMENTO PARCIAL DA IA (CORRIGIDO)
+        # ==========================================
+        if st.button("💾 Salvar Alterações e Treinar IA", type="primary", width='stretch'):
+            # 1. Identifica apenas as linhas que foram de fato alteradas usando busca por ID exclusivo
             linhas_alteradas = []
 
-            for idx, row_ajustada in df_ajustado_recentes.iterrows():
-                row_original = df_editavel.iloc[idx]
+            for _, row_ajustada in df_ajustado_recentes.iterrows():
+                # Busca a linha original correspondente pelo 'id' único da transação
+                id_transacao = row_ajustada['id']
+                row_original_list = df_editavel[df_editavel['id'] == id_transacao]
 
-                # Se mudou Grupo, Subgrupo ou Subcategoria
+                if row_original_list.empty:
+                    continue
+
+                row_original = row_original_list.iloc[0]
+
+                # Se houve mudança no Grupo, Subgrupo ou Subcategoria
                 if (row_ajustada['grupo'] != row_original['grupo'] or
                         row_ajustada['subgrupo'] != row_original['subgrupo'] or
                         row_ajustada['subcategoria'] != row_original['subcategoria']):
+
+                    # Ignoramos se o usuário "limpou" ou deixou como "A Categorizar" / em branco nas alteradas
+                    if (pd.isna(row_ajustada['grupo']) or str(row_ajustada['grupo']).strip() in ["", "A Categorizar"]):
+                        continue
+
                     linhas_alteradas.append(row_ajustada)
 
             if len(linhas_alteradas) == 0:
-                st.info("Nenhuma classificação foi alterada.")
+                st.info("Nenhuma classificação alterada foi detectada para salvamento.")
             else:
                 sucesso_update = True
                 dados_para_treino = []
+                validacao_ok = True
 
-                with st.spinner(f"Atualizando {len(linhas_alteradas)} registros e alimentando o cérebro da IA..."):
-                    from database import supabase
+                # 2. VALIDAÇÃO DE COERÊNCIA APENAS PARA AS LINHAS ALTERADAS (IGNORA TRANSFERÊNCIAS)
+                for row in linhas_alteradas:
+                    # Se for transferência, não validamos contra a tabela de categorias comuns
+                    if row.get("tipo") == "Transferência":
+                        continue
 
-                    for row in linhas_alteradas:
-                        # Atualiza no Supabase usando o ID único da transação
-                        res = supabase.table("transacoes").update({
-                            "grupo": row["grupo"],
-                            "subgrupo": row["subgrupo"],
-                            "subcategoria": row["subcategoria"]
-                        }).eq("id", row["id"]).eq("username", usuario_atual).execute()
+                    relacao_valida = df_cats[
+                        (df_cats['grupo'] == row["grupo"]) &
+                        (df_cats['subgrupo'] == row["subgrupo"]) &
+                        (df_cats['subcategoria'] == row["subcategoria"])
+                        ]
+                    if relacao_valida.empty:
+                        st.error(
+                            f"❌ A combinação selecionada para '{row['descricao']}' (Grupo: {row['grupo']} ➔ Subgrupo: {row['subgrupo']} ➔ Subcategoria: {row['subcategoria']}) não é válida nas suas Configurações. Por favor, corrija-a antes de salvar.")
+                        validacao_ok = False
+                        break
 
-                        if res.data:
-                            # Prepara dado estruturado para re-treinar o modelo
-                            dados_para_treino.append({
-                                "descricao": row["descricao"],
+                # 3. EFETUA O SALVAMENTO PARCIAL NO BANCO E TREINA A IA
+                if validacao_ok:
+                    with st.spinner(f"Atualizando {len(linhas_alteradas)} registros e alimentando o cérebro da IA..."):
+                        from database import supabase
+
+                        for row in linhas_alteradas:
+                            # Atualiza no Supabase usando o ID único da transação
+                            res = supabase.table("transacoes").update({
                                 "grupo": row["grupo"],
                                 "subgrupo": row["subgrupo"],
                                 "subcategoria": row["subcategoria"]
-                            })
-                        else:
-                            sucesso_update = False
+                            }).eq("id", row["id"]).eq("username", usuario_atual).execute()
 
-                if sucesso_update:
-                    # Alimenta a Inteligência Artificial com as novas classificações corretas!
-                    treinar_sistema(dados_para_treino, usuario_atual)
-                    st.success(
-                        f"✅ {len(dados_para_treino)} lançamentos atualizados e Inteligência Artificial re-treinada com sucesso!")
-                    st.rerun()
-                else:
-                    st.error("Ocorreu um problema ao salvar algumas atualizações no Supabase.")
+                            if res.data:
+                                # Prepara dado estruturado para re-treinar o modelo
+                                dados_para_treino.append({
+                                    "descricao": row["descricao"],
+                                    "grupo": row["grupo"],
+                                    "subgrupo": row["subgrupo"],
+                                    "subcategoria": row["subcategoria"]
+                                })
+                            else:
+                                sucesso_update = False
 
-        # --- SEÇÃO EXPANDER DE EDIÇÃO/EXCLUSÃO AVANÇADA ---
-        with st.expander("🛠️ Outras Opções (Alterar Valor/Data ou Excluir Lançamento)"):
+                    if sucesso_update:
+                        # Alimenta a Inteligência Artificial com o lote que foi salvo
+                        treinar_sistema(dados_para_treino, usuario_atual)
+                        st.success(
+                            f"✅ {len(dados_para_treino)} lançamentos atualizados e Inteligência Artificial re-treinada com sucesso!")
+                        st.rerun()
+                    else:
+                        st.error("Ocorreu um problema ao salvar algumas atualizações no Supabase.")
+        # ==========================================
+
+        # --- SEÇÃO EXPANDER DE EDIÇÃO/EXCLUSÃO AVANÇADA COM HIERARQUIA INTELIGENTE ---
+        with st.expander("🛠️ Outras Opções (Alterar Valor/Data/Hierarquia ou Excluir Lançamento)"):
             st.write("Copie o ID da tabela acima para fazer alterações estruturais ou deletar o registro.")
             id_para_editar = st.text_input("Cole o ID do lançamento:", key="input_id_edit")
 
@@ -567,10 +623,34 @@ def render_lancamentos():
 
                         nova_desc_ed = st.text_input("Nova Descrição", value=str(row['descricao'] or ""))
 
+                        # HIERARQUIA INTEGRALMENTE FILTRADA NA EDICÃO INDIVIDUAL
+                        st.markdown("##### 📌 Atualizar Classificação da Categoria")
+                        c_cat1, c_cat2, c_cat3 = st.columns(3)
+
+                        with c_cat1:
+                            lista_g = sorted(df_cats['grupo'].unique())
+                            idx_g = list(lista_g).index(row['grupo']) if row['grupo'] in lista_g else 0
+                            novo_grupo = st.selectbox("Grupo", lista_g, index=idx_g, key="edit_grupo_form")
+
+                        with c_cat2:
+                            # FILTRO DINÂMICO 1: Subgrupos disponíveis apenas para o Grupo selecionado acima
+                            opts_sub = df_cats[df_cats['grupo'] == novo_grupo]['subgrupo'].unique()
+                            opts_sub_sorted = sorted(opts_sub) if len(opts_sub) > 0 else ["Padrão"]
+                            idx_sub = list(opts_sub_sorted).index(row['subgrupo']) if row['subgrupo'] in opts_sub_sorted else 0
+                            novo_subgrupo = st.selectbox("Subgrupo", opts_sub_sorted, index=idx_sub, key="edit_subgrupo_form")
+
+                        with c_cat3:
+                            # FILTRO DINÂMICO 2: Subcategorias disponíveis apenas para o Grupo e Subgrupo selecionados
+                            filtro_sub_edit = (df_cats['grupo'] == novo_grupo) & (df_cats['subgrupo'] == novo_subgrupo)
+                            opts_subcat = df_cats[filtro_sub_edit]['subcategoria'].unique()
+                            opts_subcat_sorted = sorted(opts_subcat) if len(opts_subcat) > 0 else ["Padrão"]
+                            idx_subcat = list(opts_subcat_sorted).index(row['subcategoria']) if row['subcategoria'] in opts_subcat_sorted else 0
+                            nova_subcategoria = st.selectbox("Subcategoria", opts_subcat_sorted, index=idx_subcat, key="edit_subcat_form")
+
                         btn_save, btn_del = st.columns(2)
 
                         if btn_save.form_submit_button("💾 Salvar Alterações Estruturais", type="primary",
-                                                       use_container_width=True):
+                                                       width="stretch"):
                             if row['tipo'] == "Transferência":
                                 valor_final_ed = -novo_valor_ed if row['valor'] < 0 else novo_valor_ed
                             else:
@@ -581,22 +661,25 @@ def render_lancamentos():
                                 "valor": valor_final_ed,
                                 "data": str(nova_data_ed),
                                 "conta": nova_conta_ed,
-                                "descricao": nova_desc_ed
+                                "descricao": nova_desc_ed,
+                                "grupo": novo_grupo,
+                                "subgrupo": novo_subgrupo,
+                                "subcategoria": nova_subcategoria
                             }).eq("id", id_para_editar).eq("username", usuario_atual).execute()
 
                             if res.data:
                                 dados_treino_update = {
                                     "descricao": nova_desc_ed,
-                                    "grupo": row['grupo'],
-                                    "subgrupo": row['subgrupo'],
-                                    "subcategoria": row['subcategoria']
+                                    "grupo": novo_grupo,
+                                    "subgrupo": novo_subgrupo,
+                                    "subcategoria": nova_subcategoria
                                 }
                                 treinar_sistema([dados_treino_update], usuario_atual)
 
                                 st.success("✅ Atualizado com sucesso!")
                                 st.rerun()
 
-                        if btn_del.form_submit_button("🗑️ Excluir Registro", use_container_width=True):
+                        if btn_del.form_submit_button("🗑️ Excluir Registro", width="stretch"):
                             from database import supabase
 
                             if row.get('id_agrupador'):
