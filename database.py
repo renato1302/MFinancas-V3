@@ -8,9 +8,44 @@ url: str = st.secrets["SUPABASE_URL"]
 key: str = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(url, key)
 
+
 def get_supabase():
     """Retorna a instância do cliente Supabase."""
     return supabase
+
+
+# --- GABARITO DE CONTAS PARA NOVOS USUÁRIOS (ONBOARDING) ---
+
+CONTAS_MODELO = [
+    # --- GRANDES BANCOS (TRADICIONAIS) ---
+    {"nome": "Itaú", "tipo": "Conta Corrente", "vencimento": "EMPTY"},
+    {"nome": "Bradesco", "tipo": "Conta Corrente", "vencimento": "EMPTY"},
+    {"nome": "Santander", "tipo": "Conta Corrente", "vencimento": "EMPTY"},
+    {"nome": "Banco do Brasil", "tipo": "Conta Corrente", "vencimento": "EMPTY"},
+    {"nome": "Caixa Econômica", "tipo": "Conta Corrente", "vencimento": "EMPTY"},
+
+    # --- BANCOS DIGITAIS E CARTEIRAS ---
+    {"nome": "Nubank", "tipo": "Conta Corrente", "vencimento": "EMPTY"},
+    {"nome": "Inter", "tipo": "Conta Corrente", "vencimento": "EMPTY"},
+    {"nome": "C6 Bank", "tipo": "Conta Corrente", "vencimento": "EMPTY"},
+    {"nome": "Mercado Pago", "tipo": "Conta Corrente", "vencimento": "EMPTY"},
+    {"nome": "PicPay", "tipo": "Conta Corrente", "vencimento": "EMPTY"},
+    {"nome": "PagBank", "tipo": "Conta Corrente", "vencimento": "EMPTY"},
+
+    # --- CARTÕES DE CRÉDITO ---
+    {"nome": "Cartão Nubank", "tipo": "Cartão de Crédito", "vencimento": "10"},
+    {"nome": "Cartão Inter", "tipo": "Cartão de Crédito", "vencimento": "15"},
+    {"nome": "Cartão C6", "tipo": "Cartão de Crédito", "vencimento": "10"},
+    {"nome": "Cartão Itaú", "tipo": "Cartão de Crédito", "vencimento": "05"},
+    {"nome": "Cartão Bradesco", "tipo": "Cartão de Crédito", "vencimento": "15"},
+    {"nome": "Cartão Santander", "tipo": "Cartão de Crédito", "vencimento": "08"},
+
+    # --- OUTROS E VALES ---
+    {"nome": "Dinheiro em Carteira", "tipo": "Dinheiro", "vencimento": "EMPTY"},
+    {"nome": "Vale Refeição (VR)", "tipo": "Outros", "vencimento": "EMPTY"},
+    {"nome": "Vale Alimentação (VA)", "tipo": "Outros", "vencimento": "EMPTY"}
+]
+
 
 # --- FUNÇÕES DE USUÁRIOS ---
 
@@ -23,6 +58,7 @@ def buscar_usuario(username):
         st.error(f"Erro ao buscar usuário: {e}")
         return None
 
+
 def criar_usuario(username, senha, email, nivel="Usuário"):
     """Cria um novo usuário na nuvem."""
     dados = {
@@ -34,9 +70,11 @@ def criar_usuario(username, senha, email, nivel="Usuário"):
     }
     return supabase.table("usuarios").insert(dados).execute()
 
+
 def hash_password(password):
     """Gera hash seguro para senhas."""
     return hashlib.sha256(password.encode()).hexdigest()
+
 
 # --- FUNÇÕES DE TRANSAÇÕES E LANÇAMENTOS ---
 
@@ -59,6 +97,7 @@ def carregar_dados(username=None):
         print(f"Erro ao carregar transações: {e}")
         return pd.DataFrame()
 
+
 def inserir_transacao(dados):
     """Salva uma nova transação no Supabase garantindo mapeamento de chaves."""
     try:
@@ -72,9 +111,11 @@ def inserir_transacao(dados):
         st.error(f"Erro ao salvar transação no Supabase: {e}")
         return None
 
+
 def salvar_transacao(dados):
     """Alias compatível para inserir_transacao."""
     return inserir_transacao(dados)
+
 
 # --- FUNÇÕES DE CONFIGURAÇÕES (CONTAS E CATEGORIAS) ---
 
@@ -94,6 +135,7 @@ def carregar_dados_config(tabela, username):
         print(f"Erro ao carregar {tabela}: {e}")
         return pd.DataFrame()
 
+
 def buscar_categorias(username):
     """Busca as categorias cadastradas na nuvem filtrando pelo usuário logado ou pelo admin (global)."""
     try:
@@ -106,6 +148,7 @@ def buscar_categorias(username):
         print(f"Erro ao buscar categorias: {e}")
         return pd.DataFrame()
 
+
 def buscar_contas(username):
     """Busca as contas cadastradas na nuvem filtrando pelo usuário logado ou pelo admin (global)."""
     try:
@@ -117,6 +160,50 @@ def buscar_contas(username):
     except Exception as e:
         print(f"Erro ao buscar contas: {e}")
         return pd.DataFrame()
+
+
+# --- FUNÇÕES DE ONBOARDING (BOAS-VINDAS) ---
+
+def usuario_tem_contas(username):
+    """
+    Verifica se o usuário já possui contas cadastradas no seu próprio username.
+    Contas globais do 'admin' não contam aqui.
+    """
+    try:
+        response = supabase.table("cad_contas") \
+            .select("nome") \
+            .eq("username", username) \
+            .execute()
+        return len(response.data) > 0
+    except Exception as e:
+        print(f"Erro ao verificar contas do usuário {username}: {e}")
+        # Por segurança, assume True em caso de erro de rede para não travar o fluxo
+        return True
+
+
+def inserir_contas_onboarding(username, contas_selecionadas):
+    """
+    Grava no banco todas as contas selecionadas pelo usuário no primeiro login.
+    Faz uma inserção em lote (bulk insert) para melhor performance.
+    """
+    try:
+        novas_contas = []
+        for conta in contas_selecionadas:
+            novas_contas.append({
+                "nome": conta["nome"],
+                "tipo": conta["tipo"],
+                "vencimento": conta["vencimento"],
+                "username": username
+            })
+
+        if novas_contas:
+            response = supabase.table("cad_contas").insert(novas_contas).execute()
+            return response
+        return None
+    except Exception as e:
+        st.error(f"Erro ao cadastrar contas iniciais: {e}")
+        return None
+
 
 # --- FUNÇÕES DE SALDO E DASHBOARD ---
 
@@ -134,6 +221,7 @@ def get_saldo_por_conta(nome_conta, username):
     except Exception as e:
         print(f"Erro ao obter saldo da conta {nome_conta}: {e}")
         return 0.0
+
 
 def get_saldo_por_tipo(tipo_conta, username):
     """Soma o saldo de tipos de conta (ex: Investimento) para o usuário logado."""
@@ -164,6 +252,7 @@ def get_saldo_por_tipo(tipo_conta, username):
     except Exception as e:
         print(f"Erro ao obter saldo por tipo {tipo_conta}: {e}")
         return 0.0
+
 
 def get_resumo_patrimonio(username):
     """Retorna o dicionário de resumo patrimonial formatado para cartões e KPIs."""
@@ -197,6 +286,7 @@ def get_resumo_patrimonio(username):
             "Gastos": 0.0,
             "Investido": 0.0
         }
+
 
 # --- FUNÇÕES DE INVESTIMENTOS ---
 

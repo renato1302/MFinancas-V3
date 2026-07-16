@@ -1,4 +1,5 @@
 import streamlit as st
+
 # Removida a importação do init_db que não existe mais
 
 # 1. Configuração da página (DEVE ser o primeiro comando)
@@ -11,12 +12,14 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# 3. Importações das Visões
+# 3. Importações das Visões e Funções do Banco
 from views.auth import render_auth
 from views.lancamentos import render_lancamentos
 from views.dashboard import render_dashboard
 from views.configuracoes import render_configuracoes
 from views.investimentos import render_investimentos
+from views.onboarding import exibir_onboarding  # <-- IMPORTANTE: Nova importação do Onboarding
+from database import usuario_tem_contas  # <-- IMPORTANTE: Nova importação da validação
 
 # 4. Inicialização do Banco (LINHA REMOVIDA)
 # O Supabase já está inicializado dentro do database.py
@@ -31,50 +34,57 @@ if 'logged_in' not in st.session_state:
 if not st.session_state['logged_in']:
     render_auth()
 else:
-    # Este bloco só executa se o usuário estiver logado
-    with st.sidebar:
-        st.write(f"👤 Bem-vindo(a), **{st.session_state['username']}**!")
-        st.caption(f"🛡️ Acesso: {st.session_state['role']}")
+    # --- FLUXO DE VERIFICAÇÃO DE ONBOARDING ---
+    # Se o usuário logado não tiver nenhuma conta criada no username dele,
+    # interceptamos o acesso e forçamos a tela de boas-vindas.
+    if not usuario_tem_contas(st.session_state['username']):
+        exibir_onboarding(st.session_state['username'])
 
-        if st.button("Sair (Logout)"):
-            st.session_state['logged_in'] = False
-            st.session_state['username'] = None
-            st.session_state['role'] = None
-            st.rerun()
+    else:
+        # Este bloco de navegação só executa se o usuário estiver logado E com contas configuradas
+        with st.sidebar:
+            st.write(f"👤 Bem-vindo(a), **{st.session_state['username']}**!")
+            st.caption(f"🛡️ Acesso: {st.session_state['role']}")
 
-        # --- SELETOR DE TEMA (MODO CLARO/ESCURO) ---
-        st.divider()
-        tema = st.radio(
-            "🌓 Aparência",
-            ["Escuro", "Claro"],
-            horizontal=True,
-            key="tema_global"
-        )
+            if st.button("Sair (Logout)"):
+                st.session_state['logged_in'] = False
+                st.session_state['username'] = None
+                st.session_state['role'] = None
+                st.rerun()
 
-        # Define as variáveis de cores baseadas na escolha para os gráficos
-        if tema == "Escuro":
-            st.session_state['template_grafico'] = "plotly_dark"
-            st.session_state['cor_texto'] = "white"
-        else:
-            st.session_state['template_grafico'] = "plotly_white"
-            st.session_state['cor_texto'] = "#1E1E1E"
+            # --- SELETOR DE TEMA (MODO CLARO/ESCURO) ---
+            st.divider()
+            tema = st.radio(
+                "🌓 Aparência",
+                ["Escuro", "Claro"],
+                horizontal=True,
+                key="tema_global"
+            )
 
-        st.divider()
-        st.title("💰 Finanças Pro")
+            # Define as variáveis de cores baseadas na escolha para os gráficos
+            if tema == "Escuro":
+                st.session_state['template_grafico'] = "plotly_dark"
+                st.session_state['cor_texto'] = "white"
+            else:
+                st.session_state['template_grafico'] = "plotly_white"
+                st.session_state['cor_texto'] = "#1E1E1E"
 
-        # --- MENU DINÂMICO ---
-        opcoes_menu = ["Dashboard", "Lançamentos", "Investimentos"]
-        if st.session_state['role'] == "Administrador":
-            opcoes_menu.append("Configurações")
+            st.divider()
+            st.title("💰 Finanças Pro")
 
-        menu = st.radio("Navegação", opcoes_menu)
+            # --- MENU DINÂMICO ---
+            opcoes_menu = ["Dashboard", "Lançamentos", "Investimentos"]
+            if st.session_state['role'] == "Administrador":
+                opcoes_menu.append("Configurações")
 
-    # 7. Renderização das Páginas conforme o Menu Selecionado
-    if menu == "Dashboard":
-        render_dashboard()
-    elif menu == "Lançamentos":
-        render_lancamentos()
-    elif menu == "Investimentos":
-        render_investimentos()
-    elif menu == "Configurações":
-        render_configuracoes()
+            menu = st.radio("Navegação", opcoes_menu)
+
+        # 7. Renderização das Páginas conforme o Menu Selecionado
+        if menu == "Dashboard":
+            render_dashboard()
+        elif menu == "Lançamentos":
+            render_lancamentos()
+        elif menu == "Investimentos":
+            render_investimentos()
+        elif menu == "Configurações":
+            render_configuracoes()
