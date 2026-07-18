@@ -23,6 +23,9 @@ def render_lancamentos():
     df_cats_user = buscar_categorias(usuario_atual) if usuario_atual != "admin" else pd.DataFrame()
     df_cats = pd.concat([df_cats_admin, df_cats_user]).drop_duplicates(subset=['grupo', 'subgrupo', 'subcategoria'])
 
+    # Padroniza nulos para evitar dores de cabeça com filtros na regra de 2 níveis
+    df_cats['subcategoria'] = df_cats['subcategoria'].fillna("Padrão").astype(str).str.strip()
+
     # 3. Validação de segurança
     if df_contas.empty or df_cats.empty:
         st.warning("⚠️ O Administrador precisa cadastrar Contas e Hierarquia de Categorias nas Configurações primeiro.")
@@ -50,31 +53,44 @@ def render_lancamentos():
             usar_split = False
 
             if tipo != "Transferência":
+                # Aplica filtro por tipo se a coluna existir para refinar a árvore de seleção
+                if 'tipo' in df_cats.columns:
+                    df_cats_filtrado = df_cats[df_cats['tipo'] == tipo]
+                else:
+                    df_cats_filtrado = df_cats
+
                 with c1:
-                    lista_grupos = sorted(df_cats['grupo'].unique())
+                    lista_grupos = sorted(df_cats_filtrado['grupo'].unique())
                     grupo_sel = st.selectbox("Grupo", lista_grupos, key="new_grupo")
 
                 with c2:
                     # FILTRAGEM DINÂMICA: Subgrupos dependem exclusivamente do Grupo selecionado
-                    sub_opts = df_cats[df_cats['grupo'] == grupo_sel]['subgrupo'].unique()
+                    sub_opts = df_cats_filtrado[df_cats_filtrado['grupo'] == grupo_sel]['subgrupo'].unique()
                     sub_opts_sorted = sorted(sub_opts) if len(sub_opts) > 0 else ["Padrão"]
                     subgrupo_sel = st.selectbox("Subgrupo", sub_opts_sorted, key="new_subgrupo")
 
                 with c3:
                     # FILTRAGEM DINÂMICA: Subcategorias dependem do Grupo AND Subgrupo selecionados
-                    filtro_subcat = (df_cats['grupo'] == grupo_sel) & (df_cats['subgrupo'] == subgrupo_sel)
-                    subcat_opts = df_cats[filtro_subcat]['subcategoria'].unique()
+                    filtro_subcat = (df_cats_filtrado['grupo'] == grupo_sel) & (
+                                df_cats_filtrado['subgrupo'] == subgrupo_sel)
+                    subcat_opts = df_cats_filtrado[filtro_subcat]['subcategoria'].unique()
                     subcat_opts_sorted = sorted(subcat_opts) if len(subcat_opts) > 0 else ["Padrão"]
 
-                    permitir_split = False
-                    if 'permite_split' in df_cats.columns:
-                        permitir_split = df_cats[filtro_subcat]['permite_split'].any()
+                    # REGRA DE 2 NÍVEIS: Se for Ganho, não obriga o usuário a selecionar subcategoria
+                    if tipo == "Ganho" and (len(subcat_opts_sorted) == 0 or subcat_opts_sorted == ["Padrão"]):
+                        subcat_sel = "Padrão"
+                        st.text_input("Subcategoria", value="Padrão", disabled=True, key="new_subcat_disabled")
+                    else:
+                        permitir_split = False
+                        if 'permite_split' in df_cats_filtrado.columns:
+                            permitir_split = df_cats_filtrado[filtro_subcat]['permite_split'].any()
 
-                    if permitir_split:
-                        usar_split = st.toggle("🧩 Desmembrar?", help="Ative para distribuir o valor por subcategorias")
+                        if permitir_split:
+                            usar_split = st.toggle("🧩 Desmembrar?",
+                                                   help="Ative para distribuir o valor por subcategorias")
 
-                    if not usar_split:
-                        subcat_sel = st.selectbox("Subcategoria", subcat_opts_sorted, key="new_subcat")
+                        if not usar_split:
+                            subcat_sel = st.selectbox("Subcategoria", subcat_opts_sorted, key="new_subcat")
             else:
                 subcat_sel = "Transferência"
                 grupo_sel = "Transferência"
@@ -193,7 +209,7 @@ def render_lancamentos():
                                     "tipo": tipo,
                                     "grupo": grupo_sel,
                                     "subgrupo": subgrupo_sel,
-                                    "subcategoria": subcat_sel,
+                                    "subcategoria": subcat_sel if tipo == "Gasto" else "Padrão",
                                     "conta": conta_sel,
                                     "data": str(data_lanc),
                                     "descricao": desc,
@@ -308,6 +324,9 @@ def render_lancamentos():
 
                             sugestao = sugerir_categoria(descricao_original, base_aprendizado)
 
+                            # Força a subcategoria para "Padrão" se a inteligência sugerir vazio para um Ganho
+                            subcat_sugerida = sugestao["subcategoria"] if tipo_calculado == "Gasto" else "Padrão"
+
                             transacoes_pre_analisadas.append({
                                 "Importar": not duplicado,  # Pré-desmarca os duplicados da importação automática
                                 "Status": "⚠️ Já Existe (Duplicado)" if duplicado else "✨ Novo",
@@ -317,7 +336,7 @@ def render_lancamentos():
                                 "Tipo": tipo_calculado,
                                 "Grupo": sugestao["grupo"],
                                 "Subgrupo": sugestao["subgrupo"],
-                                "Subcategoria": sugestao["subcategoria"]
+                                "Subcategoria": subcat_sugerida
                             })
 
                         # Salva permanentemente no state para não sumir no Rerun do data_editor
@@ -359,6 +378,7 @@ def render_lancamentos():
                 grupos_cadastrados = sorted(list(df_cats['grupo'].unique()))
                 subgrupos_cadastrados = sorted(list(df_cats['subgrupo'].unique()))
                 subcat_cadastradas = sorted(list(df_cats['subcategoria'].unique()))
+                if "Padrão" not in subcat_cadastradas: subcat_cadastradas.append("Padrão")
 
                 # Data Editor interativo
                 df_ajustado = st.data_editor(
@@ -400,15 +420,27 @@ def render_lancamentos():
                         transacoes_para_salvar = []
                         validacao_ok = True
 
-                        # VALIDAÇÃO DE INTEGRIDADE ANTES DE SALVAR (IMPEDE RELAÇÕES ERRADAS NA IMPORTAÇÃO)
+                        # VALIDAÇÃO DE INTEGRIDADE FLEXÍVEL (SUPORTA 2 NÍVEIS PARA RECEITAS / GANHOS)
                         for idx, row in df_para_salvar.iterrows():
-                            relacao_valida = df_cats[
-                                (df_cats['grupo'] == row["Grupo"]) &
-                                (df_cats['subgrupo'] == row["Subgrupo"]) &
-                                (df_cats['subcategoria'] == row["Subcategoria"])
-                            ]
+                            if row["Tipo"] == "Ganho":
+                                # Se for Ganho, valida se a hierarquia Pai (Grupo e Subgrupo) existe junta
+                                relacao_valida = df_cats[
+                                    (df_cats['grupo'] == row["Grupo"]) &
+                                    (df_cats['subgrupo'] == row["Subgrupo"])
+                                    ]
+                                msg_erro = f"A combinação Grupo '{row['Grupo']}' ➔ Subgrupo '{row['Subgrupo']}' não existe!"
+                            else:
+                                # Se for Gasto, exige correspondência rígida de 3 níveis
+                                relacao_valida = df_cats[
+                                    (df_cats['grupo'] == row["Grupo"]) &
+                                    (df_cats['subgrupo'] == row["Subgrupo"]) &
+                                    (df_cats['subcategoria'] == row["Subcategoria"])
+                                    ]
+                                msg_erro = f"A combinação Grupo '{row['Grupo']}' ➔ Subgrupo '{row['Subgrupo']}' ➔ Subcategoria '{row['Subcategoria']}' não existe!"
+
                             if relacao_valida.empty:
-                                st.error(f"❌ Erro na linha de Descrição '{row['Descrição']}': A combinação Grupo '{row['Grupo']}' ➔ Subgrupo '{row['Subgrupo']}' ➔ Subcategoria '{row['Subcategoria']}' não existe nas suas configurações!")
+                                st.error(
+                                    f"❌ Erro na linha de Descrição '{row['Descrição']}': {msg_erro} Verifique suas configurações.")
                                 validacao_ok = False
                                 break
 
@@ -423,7 +455,7 @@ def render_lancamentos():
                                         "tipo": row["Tipo"],
                                         "grupo": row["Grupo"],
                                         "subgrupo": row["Subgrupo"],
-                                        "subcategoria": row["Subcategoria"],
+                                        "subcategoria": row["Subcategoria"] if row["Tipo"] == "Gasto" else "Padrão",
                                         "conta": import_conta_sel,
                                         "data": row["Data"],
                                         "descricao": row["Descrição"],
@@ -484,6 +516,7 @@ def render_lancamentos():
         grupos_cadastrados = sorted(list(df_cats['grupo'].unique()))
         subgrupos_cadastrados = sorted(list(df_cats['subgrupo'].unique()))
         subcat_cadastradas = sorted(list(df_cats['subcategoria'].unique()))
+        if "Padrão" not in subcat_cadastradas: subcat_cadastradas.append("Padrão")
 
         # Mantemos apenas as colunas que nos interessam na edição
         colunas_vistas = ['id', 'data', 'tipo', 'grupo', 'subgrupo', 'subcategoria', 'conta', 'valor', 'descricao']
@@ -491,6 +524,7 @@ def render_lancamentos():
 
         # Garante a formatação de data para string amigável
         df_editavel['data'] = df_editavel['data'].dt.strftime('%Y-%m-%d')
+        df_editavel['subcategoria'] = df_editavel['subcategoria'].fillna("Padrão")
 
         # Exibe o data editor
         df_ajustado_recentes = st.data_editor(
@@ -513,7 +547,7 @@ def render_lancamentos():
         )
 
         # ==========================================
-        # MODIFICAÇÃO AQUI: SALVAMENTO PARCIAL DA IA (CORRIGIDO)
+        # SALVAMENTO PARCIAL DA IA E 2 NÍVEIS ADAPTADO
         # ==========================================
         if st.button("💾 Salvar Alterações e Treinar IA", type="primary", width='stretch'):
             # 1. Identifica apenas as linhas que foram de fato alteradas usando busca por ID exclusivo
@@ -547,20 +581,30 @@ def render_lancamentos():
                 dados_para_treino = []
                 validacao_ok = True
 
-                # 2. VALIDAÇÃO DE COERÊNCIA APENAS PARA AS LINHAS ALTERADAS (IGNORA TRANSFERÊNCIAS)
+                # 2. VALIDAÇÃO ADAPTATIVA DE COERÊNCIA APENAS PARA AS LINHAS ALTERADAS
                 for row in linhas_alteradas:
                     # Se for transferência, não validamos contra a tabela de categorias comuns
                     if row.get("tipo") == "Transferência":
                         continue
 
-                    relacao_valida = df_cats[
-                        (df_cats['grupo'] == row["grupo"]) &
-                        (df_cats['subgrupo'] == row["subgrupo"]) &
-                        (df_cats['subcategoria'] == row["subcategoria"])
-                        ]
+                    if row["tipo"] == "Ganho":
+                        # Validação flexível para receitas (2 níveis)
+                        relacao_valida = df_cats[
+                            (df_cats['grupo'] == row["grupo"]) &
+                            (df_cats['subgrupo'] == row["subgrupo"])
+                            ]
+                        msg_erro = f"A combinação Grupo: {row['grupo']} ➔ Subgrupo: {row['subgrupo']} não existe."
+                    else:
+                        # Validação rígida para despesas (3 níveis)
+                        relacao_valida = df_cats[
+                            (df_cats['grupo'] == row["grupo"]) &
+                            (df_cats['subgrupo'] == row["subgrupo"]) &
+                            (df_cats['subcategoria'] == row["subcategoria"])
+                            ]
+                        msg_erro = f"A combinação Grupo: {row['grupo']} ➔ Subgrupo: {row['subgrupo']} ➔ Subcategoria: {row['subcategoria']} não é válida."
+
                     if relacao_valida.empty:
-                        st.error(
-                            f"❌ A combinação selecionada para '{row['descricao']}' (Grupo: {row['grupo']} ➔ Subgrupo: {row['subgrupo']} ➔ Subcategoria: {row['subcategoria']}) não é válida nas suas Configurações. Por favor, corrija-a antes de salvar.")
+                        st.error(f"❌ Erro em '{row['descricao']}': {msg_erro} Corrija antes de prosseguir.")
                         validacao_ok = False
                         break
 
@@ -574,7 +618,7 @@ def render_lancamentos():
                             res = supabase.table("transacoes").update({
                                 "grupo": row["grupo"],
                                 "subgrupo": row["subgrupo"],
-                                "subcategoria": row["subcategoria"]
+                                "subcategoria": row["subcategoria"] if row["tipo"] == "Gasto" else "Padrão"
                             }).eq("id", row["id"]).eq("username", usuario_atual).execute()
 
                             if res.data:
@@ -583,7 +627,7 @@ def render_lancamentos():
                                     "descricao": row["descricao"],
                                     "grupo": row["grupo"],
                                     "subgrupo": row["subgrupo"],
-                                    "subcategoria": row["subcategoria"]
+                                    "subcategoria": row["subcategoria"] if row["tipo"] == "Gasto" else "Padrão"
                                 })
                             else:
                                 sucesso_update = False
@@ -636,16 +680,26 @@ def render_lancamentos():
                             # FILTRO DINÂMICO 1: Subgrupos disponíveis apenas para o Grupo selecionado acima
                             opts_sub = df_cats[df_cats['grupo'] == novo_grupo]['subgrupo'].unique()
                             opts_sub_sorted = sorted(opts_sub) if len(opts_sub) > 0 else ["Padrão"]
-                            idx_sub = list(opts_sub_sorted).index(row['subgrupo']) if row['subgrupo'] in opts_sub_sorted else 0
-                            novo_subgrupo = st.selectbox("Subgrupo", opts_sub_sorted, index=idx_sub, key="edit_subgrupo_form")
+                            idx_sub = list(opts_sub_sorted).index(row['subgrupo']) if row[
+                                                                                          'subgrupo'] in opts_sub_sorted else 0
+                            novo_subgrupo = st.selectbox("Subgrupo", opts_sub_sorted, index=idx_sub,
+                                                         key="edit_subgrupo_form")
 
                         with c_cat3:
-                            # FILTRO DINÂMICO 2: Subcategorias disponíveis apenas para o Grupo e Subgrupo selecionados
-                            filtro_sub_edit = (df_cats['grupo'] == novo_grupo) & (df_cats['subgrupo'] == novo_subgrupo)
-                            opts_subcat = df_cats[filtro_sub_edit]['subcategoria'].unique()
-                            opts_subcat_sorted = sorted(opts_subcat) if len(opts_subcat) > 0 else ["Padrão"]
-                            idx_subcat = list(opts_subcat_sorted).index(row['subcategoria']) if row['subcategoria'] in opts_subcat_sorted else 0
-                            nova_subcategoria = st.selectbox("Subcategoria", opts_subcat_sorted, index=idx_subcat, key="edit_subcat_form")
+                            # FILTRO DINÂMICO 2: Subcategorias operando sob a regra condicional de tipo
+                            if row['tipo'] == "Ganho":
+                                nova_subcategoria = "Padrão"
+                                st.text_input("Subcategoria", value="Padrão", disabled=True,
+                                              key="edit_subcat_disabled_form")
+                            else:
+                                filtro_sub_edit = (df_cats['grupo'] == novo_grupo) & (
+                                            df_cats['subgrupo'] == novo_subgrupo)
+                                opts_subcat = df_cats[filtro_sub_edit]['subcategoria'].unique()
+                                opts_subcat_sorted = sorted(opts_subcat) if len(opts_subcat) > 0 else ["Padrão"]
+                                idx_subcat = list(opts_subcat_sorted).index(row['subcategoria']) if row[
+                                                                                                        'subcategoria'] in opts_subcat_sorted else 0
+                                nova_subcategoria = st.selectbox("Subcategoria", opts_subcat_sorted, index=idx_subcat,
+                                                                 key="edit_subcat_form")
 
                         btn_save, btn_del = st.columns(2)
 
@@ -664,7 +718,7 @@ def render_lancamentos():
                                 "descricao": nova_desc_ed,
                                 "grupo": novo_grupo,
                                 "subgrupo": novo_subgrupo,
-                                "subcategoria": nova_subcategoria
+                                "subcategoria": nova_subcategoria if row['tipo'] == "Gasto" else "Padrão"
                             }).eq("id", id_para_editar).eq("username", usuario_atual).execute()
 
                             if res.data:
@@ -672,7 +726,7 @@ def render_lancamentos():
                                     "descricao": nova_desc_ed,
                                     "grupo": novo_grupo,
                                     "subgrupo": novo_subgrupo,
-                                    "subcategoria": nova_subcategoria
+                                    "subcategoria": nova_subcategoria if row['tipo'] == "Gasto" else "Padrão"
                                 }
                                 treinar_sistema([dados_treino_update], usuario_atual)
 
@@ -689,7 +743,7 @@ def render_lancamentos():
                             else:
                                 res = supabase.table("transacoes").delete().eq("id", id_para_editar).eq("username",
                                                                                                         usuario_atual).execute()
-                                st.warning("⚠️ Lançamento removido!")
+                                m = st.warning("⚠️ Lançamento removido!")
 
                             st.rerun()
                 else:

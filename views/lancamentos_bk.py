@@ -1,9 +1,9 @@
 import streamlit as st
 import pandas as pd
-# Importamos as funções que conversam com o Supabase
-from database import buscar_contas, buscar_categorias, carregar_dados, inserir_transacao
 import uuid
 from datetime import datetime
+# Importamos as funções que conversam com o Supabase
+from database import buscar_contas, buscar_categorias, carregar_dados, inserir_transacao
 # IMPORTAÇÃO DO MÓDULO DE INTELIGÊNCIA ARTIFICIAL / APRENDIZADO
 from services.inteligencia import treinar_sistema, buscar_base_aprendizado, sugerir_categoria
 
@@ -134,7 +134,7 @@ def render_lancamentos():
                                         "data": str(data_lanc),
                                         "descricao": f"{desc} [{row['Subcategoria']}]",
                                         "id_agrupador": id_agrupador,
-                                        "usuario_id": usuario_atual
+                                        "username": usuario_atual
                                     }
                                     if inserir_transacao(dados_lanc):
                                         transacoes_salvas.append(dados_lanc)
@@ -165,7 +165,7 @@ def render_lancamentos():
                                     "data": str(data_lanc),
                                     "descricao": f"TR (Saída): {desc}",
                                     "id_agrupador": id_transf,
-                                    "usuario_id": usuario_atual
+                                    "username": usuario_atual
                                 }
 
                                 dados_entrada = {
@@ -178,7 +178,7 @@ def render_lancamentos():
                                     "data": str(data_lanc),
                                     "descricao": f"TR (Entrada): {desc}",
                                     "id_agrupador": id_transf,
-                                    "usuario_id": usuario_atual
+                                    "username": usuario_atual
                                 }
 
                                 if inserir_transacao(dados_saida) and inserir_transacao(dados_entrada):
@@ -197,7 +197,7 @@ def render_lancamentos():
                                     "conta": conta_sel,
                                     "data": str(data_lanc),
                                     "descricao": desc,
-                                    "usuario_id": usuario_atual
+                                    "username": usuario_atual
                                 }
 
                                 if inserir_transacao(dados_simples):
@@ -427,7 +427,7 @@ def render_lancamentos():
                                         "conta": import_conta_sel,
                                         "data": row["Data"],
                                         "descricao": row["Descrição"],
-                                        "usuario_id": usuario_atual
+                                        "username": usuario_atual
                                     }
 
                                     if not inserir_transacao(dados_lanc):

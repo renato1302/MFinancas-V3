@@ -90,36 +90,49 @@ def render_configuracoes():
             st.warning("⚠️ Acesso Restrito: Apenas administradores podem gerenciar a hierarquia de categorias.")
         else:
             st.subheader("Nova Categoria / Subcategoria")
+
+            # Seletor do tipo de fluxo para controlar dinamicamente a necessidade de 2 ou 3 níveis
+            tipo_cat_fluxo = st.radio("Tipo do Fluxo:", ["Gasto", "Ganho"], horizontal=True, key="config_tipo_cat")
+
             with st.form("form_cat", clear_on_submit=True):
                 col1, col2, col3 = st.columns(3)
-                g = col1.text_input("Grupo (Ex: Essencial)")
-                sg = col2.text_input("Subgrupo (Ex: Moradia)")
-                sc = col3.text_input("Subcategoria (Ex: Aluguel)")
+                g = col1.text_input("Grupo (Ex: Essencial ou Receitas)")
+                sg = col2.text_input("Subgrupo (Ex: Moradia ou Salário)")
 
-                split = st.toggle("Permitir Split (Divisão) nesta categoria?",
-                                  help="Ativa o desmembramento de valores")
+                # REGRA DE 2 NÍVEIS: Se for receita (Ganho), o terceiro nível é "Padrão" de forma compulsória
+                if tipo_cat_fluxo == "Ganho":
+                    sc = "Padrão"
+                    col3.text_input("Subcategoria (Nível Desativado para Ganhos)", value="Padrão", disabled=True)
+                    split = False
+                else:
+                    sc = col3.text_input("Subcategoria (Ex: Aluguel)")
+                    split = st.toggle("Permitir Split (Divisão) nesta categoria?",
+                                      help="Ativa o desmembramento de valores")
 
                 if st.form_submit_button("Salvar Categoria", width='stretch'):
                     if g and sg and sc:
                         try:
+                            tabela_alvo = "cad_categories" if "cad_categories" in globals() else "cad_categorias"
+
                             nova_cat = {
                                 "grupo": g.strip(),
                                 "subgrupo": sg.strip(),
                                 "subcategoria": sc.strip(),
-                                "permite_split": split,
+                                "permite_split": split if tipo_cat_fluxo == "Gasto" else False,
                                 "username": usuario_atual
                             }
 
-                            supabase.table(
-                                "cad_categories" if "cad_categories" in globals() else "cad_categorias").insert(
-                                nova_cat).execute()
+                            # Adiciona coluna tipo caso sua tabela suporte este controle explícito
+                            nova_cat["tipo"] = tipo_cat_fluxo
+
+                            supabase.table(tabela_alvo).insert(nova_cat).execute()
 
                             st.success("✅ Hierarquia atualizada no Supabase!")
                             st.rerun()
                         except Exception as e:
                             st.error(f"Erro ao salvar categoria: {e}")
                     else:
-                        st.error("Preencha todos os campos (Grupo, Subgrupo e Subcategoria).")
+                        st.error("Preencha os campos obrigatórios (Grupo e Subgrupo).")
 
             st.divider()
 
@@ -127,9 +140,17 @@ def render_configuracoes():
             df_cats_local = buscar_categorias(usuario_atual)
 
             if not df_cats_local.empty:
+                # Garante que nulos venham como "Padrão" visualmente no grid
+                df_cats_local['subcategoria'] = df_cats_local['subcategoria'].fillna("Padrão")
+
                 st.write("### Hierarquia Atual")
-                st.dataframe(df_cats_local[['grupo', 'subgrupo', 'subcategoria', 'permite_split']],
-                             width='stretch', hide_index=True)
+
+                # Exibe colunas apropriadas incluindo tipo se disponível
+                colunas_grid = ['grupo', 'subgrupo', 'subcategoria', 'permite_split']
+                if 'tipo' in df_cats_local.columns:
+                    colunas_grid.insert(0, 'tipo')
+
+                st.dataframe(df_cats_local[colunas_grid], width='stretch', hide_index=True)
 
                 with st.expander("🗑️ Remover Categoria"):
                     df_cats_local['identificador'] = df_cats_local['grupo'] + " > " + df_cats_local[
@@ -139,9 +160,10 @@ def render_configuracoes():
                     if st.button("Confirmar Exclusão de Categoria", type="secondary", width='stretch'):
                         try:
                             parts = escolha.split(" > ")
+                            tabela_alvo = "cad_categories" if "cad_categories" in globals() else "cad_categorias"
 
                             # DELETE NO SUPABASE: Filtrando pelos 3 níveis + username por segurança
-                            supabase.table("cad_categorias").delete() \
+                            supabase.table(tabela_alvo).delete() \
                                 .eq("grupo", parts[0]) \
                                 .eq("subgrupo", parts[1]) \
                                 .eq("subcategoria", parts[2]) \
