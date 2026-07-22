@@ -92,8 +92,9 @@ def render_dashboard():
 
         # --- CONFIGURADOR DE METAS ---
         with st.sidebar.expander("🎯 Definir Metas", expanded=False):
-            grupos_reais = sorted(
-                [g for g in df['grupo'].unique() if g not in ['Ajuste Cartão', 'Ganho', 'Transferência', None]])
+            # Usamos .dropna() para remover os nulos antes de filtrar
+            grupos_reais = sorted([str(g) for g in df['grupo'].dropna().unique() if
+                                   str(g) not in ['Ajuste Cartão', 'Ganho', 'Transferência']])
             metas_dinamicas = {grupo: st.number_input(f"Meta: {grupo}", min_value=0.0, step=50.0, key=f"m_{grupo}") for
                                grupo in grupos_reais}
 
