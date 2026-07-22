@@ -506,7 +506,8 @@ def render_dashboard():
             with c1:
                 filtro_tipo = st.selectbox("1. Filtrar por:", ["Conta", "Grupo"], key="sb_filtro_tipo")
             with c2:
-                opcoes_f = sorted(df_mes[filtro_tipo.lower()].unique())
+                # Usa .dropna() para remover vazios e str(x) para garantir que tudo seja texto
+                opcoes_f = sorted([str(x) for x in df_mes[filtro_tipo.lower()].dropna().unique()])
                 val_f = st.selectbox(f"2. Selecione {filtro_tipo}:", opcoes_f, key="sb_filtro_val")
 
             df_filtrado = df_mes[df_mes[filtro_tipo.lower()] == val_f].copy()
