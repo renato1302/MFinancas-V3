@@ -1,79 +1,106 @@
 import streamlit as st
 import pandas as pd
-from database import ler_dados, executar_query, hash_password
+from database import buscar_usuario, criar_usuario, hash_password
 
 
 def render_auth():
-    st.title("🔐 Acesso ao Sistema Finanças Pro")
-    st.write("Por favor, identifique-se para continuar.")
+    # 1. TÍTULO COMPACTO E RESPONSIVO (Mesmo padrão do Dashboard)
+    st.markdown("## 🔐 Finanças Pro  \n<small>Acesso ao Sistema</small>", unsafe_allow_html=True)
 
-    tab_login, tab_cadastrar, tab_recuperar = st.tabs(["🔑 Login", "📝 Cadastrar", "❓ Esqueci a Senha"])
+    # Reduzimos o texto de instrução para ganhar altura
+    st.caption("Identifique-se para continuar.")
+
+    # 2. ABAS OTIMIZADAS PARA IPHONE (Nomes mais curtos evitam quebra lateral)
+    tab_login, tab_cadastrar, tab_recuperar = st.tabs(["🔑 Entrar", "📝 Criar", "❓ Senha"])
 
     with tab_login:
-        with st.form("form_login"):
-            usuario = st.text_input("Usuário")
-            senha = st.text_input("Senha", type="password")
-            if st.form_submit_button("Entrar", type="primary"):
-                if usuario and senha:
-                    df_users = ler_dados("usuarios")
-                    if not df_users.empty:
-                        user_row = df_users[df_users['username'] == usuario]
-                        if not user_row.empty:
-                            if user_row.iloc[0]['senha'] == hash_password(senha):
-                                # VERIFICAÇÃO DE APROVAÇÃO ADICIONADA AQUI
-                                if user_row.iloc[0]['aprovado']:
-                                    st.session_state['logged_in'] = True
-                                    st.session_state['username'] = usuario
-                                    st.session_state['role'] = user_row.iloc[0]['nivel']
-                                    st.rerun()
-                                else:
-                                    st.error("⏳ Seu cadastro está pendente de aprovação pelo Administrador.")
-                            else:
-                                st.error("Senha incorreta.")
+        # Mantemos sua interface limpa para mobile
+        usuario = st.text_input("Usuário", key="user_login")
+        senha = st.text_input("Senha", type="password", key="pass_login")
+
+        # Botão com largura total para facilitar o toque no iPhone
+        if st.button("Entrar no Sistema", type="primary", width='stretch'):
+            if usuario and senha:
+                # --- MUDANÇA AQUI: Buscamos direto no Supabase ---
+                user_info = buscar_usuario(usuario)
+
+                if user_info:
+                    # No Supabase, user_info já vem como um dicionário (uma linha de dados)
+                    if user_info['senha'] == hash_password(senha):
+                        if user_info['aprovado']:
+                            st.session_state['logged_in'] = True
+                            st.session_state['username'] = usuario
+                            st.session_state['role'] = user_info['nivel']
+
+                            # Guardamos o username como ID único, como você já fazia
+                            st.session_state['usuario_id'] = usuario
+
+                            st.success(f"Bem-vindo, {usuario}!")
+                            st.rerun()
                         else:
-                            st.error("Usuário não encontrado.")
+                            st.error("⏳ Cadastro pendente de aprovação.")
                     else:
-                        st.error("Nenhum usuário no banco. Faça o cadastro ou use o admin padrão (admin / admin123).")
+                        st.error("Senha incorreta.")
                 else:
-                    st.warning("Preencha usuário e senha.")
+                    st.error("Usuário não encontrado.")
+            else:
+                st.warning("Preencha os campos.")
 
     with tab_cadastrar:
-        with st.form("form_cadastro"):
-            novo_user = st.text_input("Novo Usuário")
-            novo_email = st.text_input("E-mail")
-            nova_senha = st.text_input("Senha", type="password")
-            nivel = st.selectbox("Nível de Acesso Solicitado", ["Somente Leitura", "Consegue Ler e Lançamentos", "Administrador"])
+        st.markdown("##### Novo Cadastro")
+        novo_user = st.text_input("Usuário", key="reg_user")
+        novo_email = st.text_input("E-mail", key="reg_email")
+        nova_senha = st.text_input("Senha", type="password", key="reg_pass")
 
-            if st.form_submit_button("Solicitar Cadastro"):
-                if novo_user and nova_senha and novo_email:
-                    df_users = ler_dados("usuarios")
-                    if not df_users.empty and novo_user in df_users['username'].values:
-                        st.error("Este nome de usuário já existe.")
-                    else:
-                        # NOVO USUÁRIO ENTRA COM aprovado = False
-                        executar_query("INSERT INTO usuarios VALUES (?, ?, ?, ?, ?)",
-                                       (novo_user.strip(), hash_password(nova_senha), novo_email.strip(), nivel, False))
-                        st.success("Usuário cadastrado com sucesso! Aguarde o Administrador aprovar seu acesso.")
+        # Selectbox adaptado para mobile
+        nivel = st.selectbox("Nível", ["Usuário", "Administrador"])
+
+        if st.button("Solicitar Acesso", width='stretch'):
+            if novo_user and nova_senha and novo_email:
+                # 1. VERIFICAÇÃO: Chamamos a função do Supabase para ver se o nome já existe
+                user_existente = buscar_usuario(novo_user.strip())
+
+                if user_existente:
+                    st.error("Este nome de usuário já está em uso.")
                 else:
-                    st.warning("Preencha todos os campos para cadastrar.")
+                    # 2. INSERÇÃO: Usamos a função criar_usuario do seu database.py
+                    try:
+                        criar_usuario(
+                            username=novo_user.strip(),
+                            senha=hash_password(nova_senha),
+                            email=novo_email.strip(),
+                            nivel=nivel
+                        )
+                        st.success("✅ Solicitação enviada! Aguarde a aprovação do Administrador.")
+                    except Exception as e:
+                        st.error(f"Erro ao cadastrar: {e}")
+            else:
+                st.warning("⚠️ Por favor, preencha todos os campos.")
 
     with tab_recuperar:
-        with st.form("form_recuperar"):
-            st.info("Digite seu usuário e e-mail cadastrado para redefinir sua senha.")
-            rec_user = st.text_input("Usuário")
-            rec_email = st.text_input("E-mail Cadastrado")
-            nova_senha_rec = st.text_input("Nova Senha", type="password")
+        st.info("Informe os dados para redefinir.")
+        rec_user = st.text_input("Usuário", key="rec_user")
+        rec_email = st.text_input("E-mail", key="rec_email")
+        nova_senha_rec = st.text_input("Nova Senha", type="password", key="rec_pass")
 
-            if st.form_submit_button("Redefinir Senha"):
-                if rec_user and rec_email and nova_senha_rec:
-                    df_users = ler_dados("usuarios")
-                    if not df_users.empty:
-                        user_row = df_users[(df_users['username'] == rec_user) & (df_users['email'] == rec_email)]
-                        if not user_row.empty:
-                            executar_query("UPDATE usuarios SET senha=? WHERE username=?",
-                                           (hash_password(nova_senha_rec), rec_user))
-                            st.success("Senha atualizada! Volte à aba de Login.")
-                        else:
-                            st.error("Usuário ou e-mail incorretos.")
+        if st.button("Atualizar Senha", width='stretch'):
+            if rec_user and rec_email and nova_senha_rec:
+                # 1. VERIFICAÇÃO: Buscamos o usuário no Supabase
+                user_info = buscar_usuario(rec_user)
+
+                # 2. VALIDAMOS: O usuário existe e o e-mail bate com o cadastrado?
+                if user_info and user_info['email'] == rec_email.strip():
+                    try:
+                        # 3. ATUALIZAÇÃO: Comando direto do Supabase
+                        supabase.table("usuarios") \
+                            .update({"senha": hash_password(nova_senha_rec)}) \
+                            .eq("username", rec_user) \
+                            .execute()
+
+                        st.success("✅ Senha alterada com sucesso! Agora você pode entrar na aba 'Login'.")
+                    except Exception as e:
+                        st.error(f"Erro ao atualizar no banco: {e}")
                 else:
-                    st.warning("Preencha todos os campos.")
+                    st.error("❌ Dados incorretos. Usuário ou E-mail não conferem.")
+            else:
+                st.warning("⚠️ Preencha todos os campos.")

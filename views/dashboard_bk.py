@@ -3,10 +3,19 @@ import plotly.express as px
 import yfinance as yf
 import plotly.graph_objects as go
 import pandas as pd
-import os
-import duckdb
 from datetime import datetime, timedelta
-from database import carregar_dados, get_saldo_por_conta, ler_dados, get_saldo_por_tipo
+
+
+# IMPORTAÇÕES DO DATABASE (Ajustadas para o Supabase)
+from database import (
+    carregar_dados,
+    carregar_transacoes_invest,
+    get_saldo_por_conta,
+    get_saldo_por_tipo,
+    get_resumo_patrimonio  # <--- Essa função vai facilitar sua vida!
+)
+
+# Se você ainda usa investimentos, mantenha esta:
 from views.investimentos import carregar_investimentos_usuario
 
 def render_dashboard():
@@ -40,284 +49,346 @@ def render_dashboard():
             }
             </style>
         """, unsafe_allow_html=True)
+
+    # 2. BUSCA OS DADOS NA NUVEM (SUPABASE)
+    # A função get_resumo_patrimonio já faz todo o cálculo pesado para nós
+    resumo = get_resumo_patrimonio(usuario_atual)
+
+    # 3. EXIBIÇÃO DAS MÉTRICAS (CARTÕES DO TOPO)
+    # Usamos 2 colunas para o iPhone não espremer tudo em uma linha só
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.metric("💰 Disponível",
+                  f"R$ {resumo['Disponível']:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+        st.metric("📈 Ganhos", f"R$ {resumo['Ganhos']:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+
+    with col2:
+        st.metric("📉 Gastos", f"R$ {resumo['Gastos']:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+        st.metric("🏦 Investido", f"R$ {resumo['Investido']:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+
     # --- FIM DA DICA DE OURO ---
 
-    # 2. Carrega os dados passando o username
+    # 2. Carrega os dados da nuvem
     df = carregar_dados(username=usuario_atual)
 
     if df.empty:
-        st.info(f"Olá {usuario_atual}! Aguardando seus primeiros lançamentos para gerar análise...")
+        st.info(f"Olá {usuario_atual}! Aguardando seus lançamentos...")
         return
+
+    # Garantindo que os tipos estão corretos para o Pandas
+    df['data'] = pd.to_datetime(df['data'])
+    df['valor'] = pd.to_numeric(df['valor'], errors='coerce').fillna(0)
 
     aba_fin, aba_inv = st.tabs(["💰 Financeiro", "📈 Investimentos"])
 
     with aba_fin:
-
-
         # --- TRATAMENTO DE DATAS ---
-        df['data'] = pd.to_datetime(df['data'])
         df['mes_ano'] = df['data'].dt.strftime('%m/%Y')
 
-        meses_disponiveis = df[['mes_ano', 'data']].copy()
-        meses_disponiveis['sort_val'] = meses_disponiveis['data'].dt.to_period('M')
-        opcoes_mes = meses_disponiveis.sort_values('sort_val', ascending=False)['mes_ano'].unique()
-
-        # Sidebar - Seleção de Mês
+        # Ordenação decrescente (mais recente primeiro)
+        opcoes_mes = df.sort_values('data', ascending=False)['mes_ano'].unique()
         mes_sel = st.sidebar.selectbox("Mês de Referência", opcoes_mes)
 
-        # --- NOVO: CONFIGURADOR DE METAS DINÂMICO ---
-        with st.sidebar.expander("🎯 Definir Metas do Mês", expanded=False):
-            # Pegamos todos os grupos que existem nos seus dados para você não esquecer nenhum
-            grupos_reais = sorted(df['grupo'].unique().tolist())
+        # --- CONFIGURADOR DE METAS ---
+        with st.sidebar.expander("🎯 Definir Metas", expanded=False):
+            grupos_reais = sorted(
+                [g for g in df['grupo'].unique() if g not in ['Ajuste Cartão', 'Ganho', 'Transferência', None]])
+            metas_dinamicas = {grupo: st.number_input(f"Meta: {grupo}", min_value=0.0, step=50.0, key=f"m_{grupo}") for
+                               grupo in grupos_reais}
 
-            metas_dinamicas = {}
-            for grupo in grupos_reais:
-                # Ignora grupos que não fazem sentido ter meta (como ajustes ou ganhos)
-                if grupo not in ['Ajuste Cartão', 'Ganho', 'Transferência']:
-                    # Cria um campo de número para cada grupo
-                    valor_meta = st.number_input(f"Meta para {grupo}", min_value=0.0, value=0.0, step=50.0,
-                                                 key=f"meta_{grupo}")
-                    metas_dinamicas[grupo] = valor_meta
-
-        # Filtrar DF pelo mês selecionado
+        # Filtragem e Processamento
         df_mes = df[df['mes_ano'] == mes_sel].copy()
 
-        # Título conforme solicitado
         st.subheader(f"📊 MFinanças - {mes_sel}")
-        st.caption(f"Dados filtrados para o usuário: **{usuario_atual}**")
 
-        # --- PREPARAÇÃO DE DADOS PARA SALDO (INCLUI TRANSFERÊNCIAS) ---
+        # Lógica de Ajuste de Cartão (Sua sacada de mestre)
         df_processado = df_mes.copy()
-
-        # Ajuste para Pagamentos de Cartão
         pagamentos_cartao = df_processado[df_processado['grupo'] == 'Pagamento de Cartão'].copy()
+
         if not pagamentos_cartao.empty:
+            # Criamos o estorno virtual para o saldo não ficar negativo injustamente
             entradas_virtuais = pagamentos_cartao[['subcategoria', 'valor']].copy()
             entradas_virtuais.columns = ['conta', 'valor']
-            entradas_virtuais['tipo'] = 'Ganho'
-            entradas_virtuais['grupo'] = 'Ajuste Cartão'
+            entradas_virtuais['tipo'], entradas_virtuais['grupo'] = 'Ganho', 'Ajuste Cartão'
             entradas_virtuais['valor'] = entradas_virtuais['valor'].abs()
             df_processado = pd.concat([df_processado, entradas_virtuais], ignore_index=True)
 
         def calcular_impacto(row):
-            tipo = str(row['tipo']).strip().lower()
-            subcat = str(row['subcategoria']).strip().lower()
-            valor = abs(row['valor'])
-            if tipo == 'gasto':
+            # 1. Garantimos que os valores não são nulos e limpamos espaços/maiúsculas
+            tipo = str(row.get('tipo', '')).strip().lower()
+            subcat = str(row.get('subcategoria', '')).strip().lower()
+            valor = abs(float(row.get('valor', 0)))
+
+            # 2. Lógica para Gastos (Despesas)
+            if tipo in ['gasto', 'despesa']:
                 return -valor
-            elif tipo == 'ganho':
+
+            # 3. Lógica para Ganhos (Receitas)
+            elif tipo in ['ganho', 'receita']:
                 return valor
+
+            # 4. Lógica para Transferências (Entrada/Saída)
             elif 'transferência' in tipo or 'transferencia' in tipo:
                 if 'saída' in subcat or 'saida' in subcat:
                     return -valor
                 elif 'entrada' in subcat:
                     return valor
+
             return 0
 
+        # Aplicando ao DataFrame
         df_processado['impacto_saldo'] = df_processado.apply(calcular_impacto, axis=1)
 
-        # --- SEÇÃO 6: ANÁLISES GRÁFICAS ---
-        df_gastos_graf = df_mes[df_mes['tipo'] == 'Gasto'].copy()
-        df_gastos_graf['valor_abs'] = df_gastos_graf['valor'].abs()
+        # --- SEÇÃO 6: ANÁLISES GRÁFICAS (TREEMAP) ---
+
+        # 1. Filtro Robusto: Aceita 'Gasto' ou 'Despesa' e ignora maiúsculas/minúsculas
+        # O .str.lower() garante que nada fique de fora se o banco enviar 'DESPESA' ou 'gasto'
+        df_gastos_graf = df_mes[df_mes['tipo'].str.lower().isin(['gasto', 'despesa'])].copy()
+
+        # 2. Conversão de Segurança: Garante que 'valor' seja um número positivo
+        df_gastos_graf['valor_abs'] = pd.to_numeric(df_gastos_graf['valor'], errors='coerce').abs().fillna(0)
 
         if not df_gastos_graf.empty:
-            # --- 1. Treemap (Mapa de Gastos) ---
-            # Usamos o markdown adaptado para iPhone que criamos antes
-            st.markdown("### 🔲 Mapa de Gastos  \n<small>Detalhamento por Categorias</small>", unsafe_allow_html=True)
+            st.write("### 🔲 Mapa de Gastos (Treemap)")
 
-            # CAPTURA DAS VARIÁVEIS DE TEMA (Definidas no app.py)
-            tmpl = st.session_state.get('template_grafico', 'plotly_dark')
-            cor_txt = st.session_state.get('cor_texto', 'white')
-
+            # O Treemap agrupa por Grupo > Subgrupo > Subcategoria
             fig_tree = px.treemap(
                 df_gastos_graf,
                 path=['grupo', 'subgrupo', 'subcategoria'],
                 values='valor_abs',
                 color='grupo',
-                template=tmpl  # <--- AGORA É DINÂMICO
+                template=tmpl  # Usa o tema (dark/light) definido no início do dashboard
             )
 
-            # --- AJUSTE DEFINITIVO PARA VISUALIZAÇÃO DIRETA NO IPHONE ---
+            # --- AJUSTE DEFINITIVO PARA VISUALIZAÇÃO NO IPHONE ---
             fig_tree.update_traces(
-                # 1. Força o texto a aparecer dentro do quadrado (Nome + Valor)
+                # Força o texto (Nome + R$) a aparecer fixo dentro dos quadrados
                 textinfo="label+value",
-                # 2. Formata o valor para Real dentro do quadrado
+                # Formata para o padrão de moeda (R$ 1.234,56)
                 texttemplate="<b>%{label}</b><br>R$ %{value:,.2f}",
-                # 3. A cor do texto agora acompanha o tema (Preto no modo Claro, Branco no Escuro)
-                textfont=dict(size=14, color=cor_txt),
-                # 4. Melhora a caixa de detalhes
+                textfont=dict(size=14, color="white"),
+                # Hover otimizado para toque no celular
                 hovertemplate="<b>%{label}</b><br>Valor: R$ %{value:,.2f}<extra></extra>"
             )
 
             fig_tree.update_layout(
-                margin=dict(t=30, l=10, r=10, b=10),
-                height=450,
+                # Margens mínimas para aproveitar a tela do iPhone
+                margin=dict(t=30, l=5, r=5, b=5),
+                height=450,  # Altura ideal para leitura sem precisar de muito scroll
                 hoverlabel=dict(
-                    # O fundo da caixinha de detalhes também se adapta
-                    bgcolor="#1E1E1E" if tmpl == "plotly_dark" else "#F0F2F6",
+                    bgcolor="#1E1E1E",
                     font_size=16,
-                    font_color=cor_txt,
+                    font_color="white",
                     bordercolor="#00FFCC"
                 )
             )
 
-            # Renderização com interatividade reduzida para focar na leitura
+            # Renderização otimizada (sem a barra de ferramentas que atrapalha no mobile)
             st.plotly_chart(
                 fig_tree,
-                use_container_width=True,
+                width='stretch',
                 config={
                     'displayModeBar': False,
                     'staticPlot': False
                 }
             )
-
-            # Renderização com interatividade reduzida para focar na leitura
-            st.plotly_chart(
-                fig_tree,
-                use_container_width=True,
-                config={
-                    'displayModeBar': False,
-                    'staticPlot': False  # Mantemos False para você ainda conseguir expandir se quiser
-                }
-            )
+        else:
+            st.info("Nenhum gasto registrado neste mês para gerar o mapa visual.")
 
             # --- 2. Gráfico de Rosca (Gastos por Conta) ---
-            st.markdown("### 💳 Gastos por Conta  \n<small>Distribuição por Meio de Pagamento</small>",
-                        unsafe_allow_html=True)
+            # Usamos o df_gastos_graf que já filtramos na Seção 6 anterior
+            if not df_gastos_graf.empty:
+                st.write("### 💳 Gastos por Conta")
 
-            # CAPTURA DAS VARIÁVEIS DE TEMA (As mesmas que usamos no Treemap)
-            tmpl = st.session_state.get('template_grafico', 'plotly_dark')
-            cor_txt = st.session_state.get('cor_texto', 'white')
+                # Agrupamos os gastos por conta bancária/cartão
+                df_pizza = df_gastos_graf.groupby('conta')['valor_abs'].sum().reset_index()
 
-            df_pizza = df_gastos_graf.groupby('conta')['valor_abs'].sum().reset_index()
-
-            fig_pie = px.pie(
-                df_pizza,
-                values='valor_abs',
-                names='conta',
-                hole=0.4,
-                template=tmpl  # <--- AGORA USA O TEMA DINÂMICO
-            )
-
-            # AJUSTE MOBILE: Cores adaptáveis e legenda posicionada
-            fig_pie.update_layout(
-                margin=dict(t=30, l=10, r=10, b=10),
-                # A cor da legenda (nomes das contas) agora muda conforme o tema
-                legend=dict(
-                    orientation="h",
-                    yanchor="bottom",
-                    y=-0.4,
-                    xanchor="center",
-                    x=0.5,
-                    font=dict(color=cor_txt)  # <--- NOMES DAS CONTAS ADAPTÁVEIS
-                ),
-                hoverlabel=dict(
-                    # Fundo da caixa de detalhes muda para cinza claro se o tema for claro
-                    bgcolor="#1E1E1E" if tmpl == "plotly_dark" else "#F0F2F6",
-                    font_size=14,
-                    font_color=cor_txt,
-                    bordercolor="#00FFCC"
+                fig_pie = px.pie(
+                    df_pizza,
+                    values='valor_abs',
+                    names='conta',
+                    hole=0.4,
+                    template=tmpl  # Usa o tema (dark/light) definido no início
                 )
-            )
 
-            # Melhora a informação visual nas fatias
-            fig_pie.update_traces(
-                textinfo='percent+label',
-                # A cor do texto dentro das fatias (ou ao lado delas) se adapta
-                textfont=dict(color=cor_txt),
-                hovertemplate="<b>%{label}</b><br>Total: R$ %{value:,.2f}<br>Percentual: %{percent}<extra></extra>"
-            )
+                # AJUSTE MOBILE: Otimização total para a tela do iPhone
+                fig_pie.update_layout(
+                    margin=dict(t=30, l=5, r=5, b=80),  # Aumentei a margem inferior (b) para a legenda
+                    hoverlabel=dict(
+                        bgcolor="#1E1E1E",
+                        font_size=14,
+                        font_color="white",
+                        bordercolor="#00FFCC"
+                    ),
+                    legend=dict(
+                        orientation="h",  # Legenda horizontal
+                        yanchor="bottom",
+                        y=-0.6,  # Empurra a legenda bem para baixo para não espremer a rosca
+                        xanchor="center",
+                        x=0.5
+                    )
+                )
 
-            # Renderização responsiva
-            st.plotly_chart(fig_pie, use_container_width=True, config={'displayModeBar': False})
+                # Melhora a informação visual direta nas fatias
+                fig_pie.update_traces(
+                    textinfo='percent+label',  # Nome e % direto na fatia para leitura rápida
+                    # Formatação brasileira no hover (ao tocar com o dedo)
+                    hovertemplate="<b>%{label}</b><br>Total: R$ %{value:,.2f}<br>Percentual: %{percent}<extra></extra>",
+                    marker=dict(line=dict(color='#000000', width=1))  # Linha fina entre fatias para destaque
+                )
 
-        st.divider()
+                # Renderização responsiva e limpa
+                st.plotly_chart(
+                    fig_pie,
+                    width='stretch',
+                    config={'displayModeBar': False}
+                )
+            else:
+                st.info("Sem dados de gastos para detalhamento por conta.")
+
+            st.divider()
 
         # --- SEÇÃO 2: FLUXO DE CAIXA MENSAL (APENAS GANHOS/GASTOS REAIS) ---
-        df_fluxo = df_mes[~df_mes['grupo'].isin(['Transferência', 'Pagamento de Cartão'])].copy()
-        total_ganhos = df_fluxo[df_fluxo['tipo'] == 'Ganho']['valor'].sum()
-        total_gastos = abs(df_fluxo[df_fluxo['tipo'] == 'Gasto']['valor'].sum())
+
+        # 1. Filtro Inteligente: Remove transferências e pagamentos de fatura para não duplicar saídas
+        # Usamos .str.lower() para garantir que funcione independente de como foi escrito no banco
+        termos_ignorar = ['transferência', 'transferencia', 'pagamento de cartão', 'pagamento de cartao']
+        df_fluxo = df_mes[~df_mes['grupo'].str.lower().isin(termos_ignorar)].copy()
+
+        # 2. Cálculos de Base (Ganhos vs Despesas)
+        # Aceitamos 'Ganho/Receita' e 'Gasto/Despesa' para total compatibilidade com o Supabase
+        total_ganhos = df_fluxo[df_fluxo['tipo'].str.lower().isin(['ganho', 'receita'])]['valor'].sum()
+        total_gastos = abs(df_fluxo[df_fluxo['tipo'].str.lower().isin(['gasto', 'despesa'])]['valor'].sum())
         saldo_geral = total_ganhos - total_gastos
 
-        st.markdown("### Resumo Mensal  \n<small>(Fluxo de Caixa)</small>", unsafe_allow_html=True)
+        st.markdown("### Resumo Mensal  \n<small>(Fluxo de Caixa Real)</small>", unsafe_allow_html=True)
 
-        # AJUSTE RESPONSIVO:
-        # No desktop serão 3 colunas. No Mobile (iPhone), o Streamlit as empilhará automaticamente.
-        t1, t2, t3 = st.columns([1, 1, 1])
+        # 3. Métrica Responsiva para iPhone
+        # No mobile, o Streamlit empilha essas colunas, garantindo leitura total
+        t1, t2, t3 = st.columns(3)
+
+        # Função auxiliar interna para formatar moeda R$ 1.234,56
+        def fmt_br(valor):
+            return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
         with t1:
-            st.metric("TOTAL ENTRADAS", f"R$ {total_ganhos:,.2f}")
+            st.metric("TOTAL ENTRADAS", fmt_br(total_ganhos))
 
         with t2:
-            # Use delta para mostrar visualmente se o gasto subiu ou desceu (opcional)
-            st.metric("TOTAL SAÍDAS", f"R$ {total_gastos:,.2f}")
+            # Mostramos o gasto como valor positivo para facilitar a leitura da métrica
+            st.metric("TOTAL SAÍDAS", fmt_br(total_gastos))
 
         with t3:
-            # Adicionei uma cor dinâmica: verde se positivo, vermelho se negativo
-            cor_saldo = "normal" if saldo_geral >= 0 else "inverse"
-            st.metric("SALDO DO MÊS", f"R$ {saldo_geral:,.2f}", delta_color=cor_saldo)
+            # Cor dinâmica: Verde se sobrou dinheiro, Vermelho se faltou
+            st.metric(
+                "SALDO DO MÊS",
+                fmt_br(saldo_geral),
+                delta=f"{saldo_geral:,.2f}",
+                delta_color="normal" if saldo_geral >= 0 else "inverse"
+            )
 
         st.divider()
 
-        # --- SEÇÃO 4: DETALHAMENTO POR CONTA ---
+        # --- SEÇÃO 4: DETALHAMENTO POR CONTA (CARDS BANCÁRIOS) ---
         st.markdown("### 🏦 Contas e Cartões")
 
+        # 1. Agrupamos por conta e tipo para ver Entradas e Saídas separadas
+        # Usamos fill_value=0 para evitar erros se uma conta só tiver gastos ou só ganhos
         resumo_contas = df_processado.groupby(['conta', 'tipo'])['valor'].sum().unstack(fill_value=0).reset_index()
-        for col in ['Ganho', 'Gasto']:
+
+        # Padronização para o Supabase: Garante que as colunas existam (independente do nome no banco)
+        for col in ['Ganho', 'Receita', 'Gasto', 'Despesa']:
             if col not in resumo_contas: resumo_contas[col] = 0.0
 
-        saldo_real = df_processado.groupby('conta')['impacto_saldo'].sum().reset_index()
-        resumo_final_contas = saldo_real.merge(resumo_contas, on='conta', how='left').fillna(0)
+        # 2. Unificamos as colunas para facilitar o cálculo (Soma Ganho+Receita e Gasto+Despesa)
+        resumo_contas['Total_Entradas'] = resumo_contas.get('Ganho', 0) + resumo_contas.get('Receita', 0)
+        resumo_contas['Total_Saidas'] = resumo_contas.get('Gasto', 0) + resumo_contas.get('Despesa', 0)
 
-        # AJUSTE RESPONSIVO:
-        # Criamos as colunas, mas no iPhone o Streamlit vai empilhar uma por uma automaticamente
+        # 3. Calculamos o Saldo Real usando a coluna 'impacto_saldo' que criamos na função anterior
+        saldo_real = df_processado.groupby('conta')['impacto_saldo'].sum().reset_index()
+
+        # 4. Mesclamos tudo em um único DataFrame de resumo
+        resumo_final_contas = saldo_real.merge(resumo_contas[['conta', 'Total_Entradas', 'Total_Saidas']], on='conta',
+                                               how='left').fillna(0)
+
+        # 5. EXIBIÇÃO EM CARDS (Layout Responsivo para iPhone)
+        # No Desktop: 3 colunas. No iPhone: O Streamlit empilha automaticamente.
         cols = st.columns(3)
 
         for i, row in resumo_final_contas.iterrows():
-            # O operador % 3 distribui entre as 3 colunas no Desktop
+            # O operador % 3 distribui os cards entre as colunas
             with cols[i % 3]:
-                # Criamos um "Card" visual usando st.container
+                # Criamos o Card com borda para destacar cada conta no modo escuro
                 with st.container(border=True):
                     saldo_f = row['impacto_saldo']
-                    cor_saldo = "#00cc44" if saldo_f >= 0 else "#ff4b4b"  # Verde ou Vermelho padrão Streamlit
+                    # Cores dinâmicas para o saldo
+                    cor_saldo = "#00cc44" if saldo_f >= 0 else "#ff4b4b"
 
-                    # Título da Conta
+                    # Título da Conta em Negrito
                     st.markdown(f"**{row['conta']}**")
 
-                    # Valores de Entradas e Saídas em fonte menor para o iPhone
-                    st.caption(f"📥 R$ {row['Ganho']:,.2f}  \n📤 R$ {abs(row['Gasto']):,.2f}")
+                    # Detalhamento de fluxo em fonte menor (Caption)
+                    # Usamos abs() nas saídas para não mostrar sinal de menos duplo
+                    st.caption(f"📥 R$ {row['Total_Entradas']:,.2f}  \n📤 R$ {abs(row['Total_Saidas']):,.2f}")
 
-                    # Saldo em destaque
+                    # Saldo Final em Destaque Colorido
+                    # Aplicamos a formatação brasileira R$ 1.234,56
+                    valor_formatado = f"R$ {saldo_f:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
                     st.markdown(
-                        f"<p style='color:{cor_saldo}; font-weight:bold; margin-bottom:0;'>Saldo: R$ {saldo_f:,.2f}</p>",
-                        unsafe_allow_html=True)
+                        f"<p style='color:{cor_saldo}; font-weight:bold; font-size:1.1rem; margin-bottom:0;'>"
+                        f"Saldo: {valor_formatado}</p>",
+                        unsafe_allow_html=True
+                    )
 
         st.divider()
 
-
-
         # --- SEÇÃO 1: PATRIMÔNIO E ATIVOS ---
-        st.markdown("### 🏦 Gestão de Patrimônio  \n<small>(Ativos Totais)</small>", unsafe_allow_html=True)
-        # CORREÇÃO: Passando o usuario_atual para as funções de saldo
+        st.markdown("### 🏦 Gestão de Patrimônio  \n<small>(Ativos Totais e Liquidez)</small>", unsafe_allow_html=True)
+
+        # 1. Busca os saldos na nuvem (Supabase) usando o usuario_atual
+        # Note que usamos as categorias exatas que estão no seu banco de dados
         saldo_liquidez = get_saldo_por_tipo("Investimento (Liquidez)", username=usuario_atual)
         saldo_imovel = get_saldo_por_tipo("Patrimônio (Imóvel)", username=usuario_atual)
         saldo_dinheiro = get_saldo_por_tipo("Dinheiro", username=usuario_atual)
 
-        c_pat1, c_pat2, c_pat3 = st.columns(3)
-        c_pat1.metric("💰 Liquidez / Investimentos", f"R$ {saldo_liquidez:,.2f}")
-        c_pat2.metric("🏢 Patrimônio Imobiliário", f"R$ {saldo_imovel:,.2f}")
+        # 2. Cálculo do Patrimônio Total (Soma de tudo)
         total_geral_ativos = saldo_liquidez + saldo_imovel + saldo_dinheiro
-        c_pat3.metric("📈 Patrimônio Total", f"R$ {total_geral_ativos:,.2f}")
+
+        # 3. EXIBIÇÃO RESPONSIVA (3 Colunas no Desktop / Empilhado no iPhone)
+        c_pat1, c_pat2, c_pat3 = st.columns(3)
+
+        # Função rápida para formatar R$ 1.234,56
+        def fmt(v):
+            return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+        with c_pat1:
+            # Foco em Investimentos/Liquidez (Dinheiro que você pode usar rápido)
+            st.metric("💰 Liquidez / Invest.", fmt(saldo_liquidez))
+
+        with c_pat2:
+            # Foco em Bens Imobilizados (Casa, Terrenos, etc)
+            st.metric("🏢 Patrimônio Imob.", fmt(saldo_imovel))
+
+        with c_pat3:
+            # O valor mais importante: Tudo o que você construiu
+            # Adicionei um delta opcional que mostra o valor em relação ao total (exemplo visual)
+            st.metric("📈 Patrimônio Total", fmt(total_geral_ativos),
+                      help="Soma de Investimentos, Imóveis e Dinheiro em conta.")
 
         st.divider()
 
         # --- SEÇÃO 5: GRÁFICO DE COMPOSIÇÃO DE PATRIMÔNIO ---
         st.markdown("### 📊 Composição  \n<small>do Patrimônio Atual</small>", unsafe_allow_html=True)
 
+        # 1. Criamos o DataFrame de visualização com os dados já vindos do Supabase
         df_patrimonio_pizza = pd.DataFrame({
             "Categoria": ["Investimentos", "Imóveis", "Dinheiro"],
             "Valor": [saldo_liquidez, saldo_imovel, saldo_dinheiro]
         })
+
+        # Removemos categorias zeradas para o gráfico não ficar poluído
         df_patrimonio_pizza = df_patrimonio_pizza[df_patrimonio_pizza['Valor'] > 0]
 
         if not df_patrimonio_pizza.empty:
@@ -325,134 +396,147 @@ def render_dashboard():
                 df_patrimonio_pizza,
                 values='Valor',
                 names='Categoria',
-                hole=0.5,
-                template="plotly_dark",
+                hole=0.5,  # Estilo Rosca: mais elegante para Dashboards
+                template=tmpl,  # Usa o tema dinâmico (dark/light)
                 color_discrete_sequence=px.colors.qualitative.Pastel
             )
 
-            # AJUSTE RESPONSIVO PARA IPHONE:
+            # --- AJUSTE DEFINITIVO PARA IPHONE ---
             fig_pat.update_layout(
-                # Reduz margens para o gráfico ganhar tamanho na tela do celular
-                margin=dict(t=30, l=10, r=10, b=10),
-                # Move a legenda para baixo de forma horizontal
+                # Margens mínimas para o gráfico ocupar bem a largura do celular
+                margin=dict(t=30, l=5, r=5, b=60),
+                # Legenda horizontal na parte inferior
                 legend=dict(
                     orientation="h",
                     yanchor="bottom",
-                    y=-0.2,
+                    y=-0.4,  # Afasta um pouco para não encostar no gráfico
                     xanchor="center",
                     x=0.5
-                )
+                ),
+                # Remove fundo e bordas desnecessárias
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)'
             )
 
-            # Renderização usando a largura total do container (essencial para mobile)
-            # config={'displayModeBar': False} remove ícones que atrapalham o touch
-            st.plotly_chart(fig_pat, use_container_width=True, config={'displayModeBar': False})
+            # Ajuste das fatias para facilitar o toque no celular
+            fig_pat.update_traces(
+                textinfo='percent+label',  # Mostra a % e o nome direto na fatia
+                hovertemplate="<b>%{label}</b><br>Valor: R$ %{value:,.2f}<br>%: %{percent}<extra></extra>"
+            )
+
+            # Renderização responsiva (use_container_width é vital para mobile)
+            st.plotly_chart(
+                fig_pat,
+                width='stretch',
+                config={'displayModeBar': False}  # Remove a barra de ferramentas que atrapalha o touch
+            )
         else:
-            st.info("Sem dados de patrimônio para exibir o gráfico.")
+            st.info("⚠️ Sem dados de patrimônio para exibir o gráfico de composição.")
 
         st.divider()
 
-        # --- SEÇÃO 3: CONTROLE DE METAS (ATUALIZADO PARA MOBILE) ---
-        st.markdown("### 🎯 Controle de Metas  \n<small>Acompanhamento por Grupo</small>", unsafe_allow_html=True)
-        gastos_por_grupo = df_mes[df_mes['tipo'] == 'Gasto'].groupby('grupo')['valor'].sum().abs()
+        # --- SEÇÃO 3: CONTROLE DE METAS (CARDS COM BARRA DE PROGRESSO) ---
+        st.markdown("### 🎯 Controle de Metas  \n<small>Acompanhamento Real vs Planejado</small>",
+                    unsafe_allow_html=True)
 
-        # AJUSTE RESPONSIVO: No Desktop serão 2 colunas, no iPhone elas se empilham
+        # 1. Agrupamos o que você realmente gastou no mês
+        # Usamos .str.lower().isin() para capturar 'Gasto' ou 'Despesa' do Supabase
+        df_real = df_mes[df_mes['tipo'].str.lower().isin(['gasto', 'despesa'])]
+        gastos_por_grupo = df_real.groupby('grupo')['valor'].sum().abs()
+
+        # 2. Layout Responsivo: No Desktop 2 colunas, no iPhone empilha
         col_meta1, col_meta2 = st.columns(2)
 
-        # Filtrar apenas grupos que você definiu uma meta maior que zero
+        # 3. Filtramos apenas os grupos que você definiu meta na barra lateral
         grupos_com_meta = {g: v for g, v in metas_dinamicas.items() if v > 0}
 
         if not grupos_com_meta:
-            st.info("Defina os valores das metas na barra lateral para acompanhar aqui.")
+            st.info("💡 Defina os valores das metas no menu lateral (🎯 Definir Metas) para acompanhar aqui.")
         else:
-            # Transformamos em lista para usar o índice no loop de colunas
+            # Transformamos em lista para distribuir entre as colunas no loop
             itens_meta = list(grupos_com_meta.items())
 
             for i, (grupo, meta_valor) in enumerate(itens_meta):
+                # Pegamos quanto você já gastou desse grupo (se não gastou nada, assume 0.0)
                 gasto_atual = gastos_por_grupo.get(grupo, 0.0)
-                # Garante que o percentual seja entre 0.0 e 1.0 para o st.progress
+
+                # Cálculo do percentual para a barra de progresso (limite de 1.0 para o st.progress)
                 percentual = float(min(gasto_atual / meta_valor, 1.0)) if meta_valor > 0 else 0.0
 
-                # Escolhe a coluna (Alterna entre 1 e 2 no Desktop)
+                # Distribui os cards entre as colunas
                 col_alvo = col_meta1 if i % 2 == 0 else col_meta2
 
                 with col_alvo:
-                    # Usamos border=True para criar um "card" que facilita a leitura no iPhone
+                    # Usamos border=True para criar um "card" destacado no iPhone
                     with st.container(border=True):
+                        # Título do Grupo em Negrito
                         st.markdown(f"**{grupo}**")
 
-                        # Texto informativo com valores
-                        texto_meta = f"R$ {gasto_atual:,.2f} de R$ {meta_valor:,.2f}"
-                        st.caption(texto_meta)
+                        # Formatação dos valores em R$ 1.234,56
+                        gasto_f = f"R$ {gasto_atual:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                        meta_f = f"R$ {meta_valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
-                        # Barra de progresso (ocupa 100% da largura do card)
+                        st.caption(f"{gasto_f} de {meta_f}")
+
+                        # Barra de Progresso Visual
                         st.progress(percentual)
 
-                        # Alertas de texto simplificados para telas pequenas
+                        # Sistema de Alertas Rápidos (UX Mobile)
                         if percentual >= 1.0:
-                            st.error(f"🚨 Limite atingido!")
+                            st.error("🚨 Limite estourado!")
                         elif percentual >= 0.8:
-                            st.warning(f"⚠️ Atenção!")
+                            st.warning("⚠️ Próximo do limite!")
+                        else:
+                            st.success("✅ Dentro da meta")
 
         st.divider()
 
-        # --- SEÇÃO 7: ABAS DE DETALHAMENTO (OTIMIZADO MOBILE) ---
+        # --- SEÇÃO 7: ABAS DE DETALHAMENTO (FINANCEIRO) ---
         aba1, aba2, aba3 = st.tabs(["🎯 Filtros", "📈 Evolução", "📝 Tabela"])
 
         with aba1:
             st.markdown("### 🎯 Analisar Filtros  \n<small>Busca Específica</small>", unsafe_allow_html=True)
 
-            # AJUSTE: No iPhone, os selectboxes ficarão um embaixo do outro
             c1, c2 = st.columns([1, 1])
             with c1:
-                filtro_tipo = st.selectbox("1. Filtrar por:", ["Conta", "Grupo"])
+                filtro_tipo = st.selectbox("1. Filtrar por:", ["Conta", "Grupo"], key="sb_filtro_tipo")
             with c2:
                 opcoes_f = sorted(df_mes[filtro_tipo.lower()].unique())
-                val_f = st.selectbox(f"2. Selecione {filtro_tipo}:", opcoes_f)
+                val_f = st.selectbox(f"2. Selecione {filtro_tipo}:", opcoes_f, key="sb_filtro_val")
 
             df_filtrado = df_mes[df_mes[filtro_tipo.lower()] == val_f].copy()
-            total_ganhos_f = df_filtrado[df_filtrado['tipo'] == 'Ganho']['valor'].sum()
-            total_gastos_f = abs(df_filtrado[df_filtrado['tipo'] == 'Gasto']['valor'].sum())
+
+            # Compatibilidade Supabase: Gasto/Despesa e Ganho/Receita
+            total_ganhos_f = df_filtrado[df_filtrado['tipo'].str.lower().isin(['ganho', 'receita'])]['valor'].sum()
+            total_gastos_f = abs(df_filtrado[df_filtrado['tipo'].str.lower().isin(['gasto', 'despesa'])]['valor'].sum())
             saldo_filtro = total_ganhos_f - total_gastos_f
 
-            # AJUSTE: Métricas filtradas com colunas que se empilham
             cf1, cf2, cf3 = st.columns(3)
             cf1.metric("Entradas", f"R$ {total_ganhos_f:,.2f}")
             cf2.metric("Saídas", f"R$ {total_gastos_f:,.2f}")
             cf3.metric("Saldo", f"R$ {saldo_filtro:,.2f}")
 
             st.write("#### 📝 Lançamentos")
-            # AJUSTE: use_container_width=True para a tabela não cortar no iPhone
-            st.dataframe(
-                df_filtrado[['data', 'descricao', 'subcategoria', 'valor']],
-                use_container_width=True,
-                hide_index=True
-            )
+            st.dataframe(df_filtrado[['data', 'descricao', 'subcategoria', 'valor']], width='stretch',
+                         hide_index=True)
 
             if not df_filtrado.empty:
                 st.write(f"#### 🔍 Subcategorias em {val_f}")
-                df_sub = df_filtrado.groupby('subcategoria')['valor'].sum().reset_index()
-                df_sub['valor_abs'] = df_sub['valor'].abs()
-                df_sub = df_sub.sort_values(by='valor_abs', ascending=False)
+                df_sub = df_filtrado.groupby('subcategoria')['valor'].sum().abs().reset_index()
+                df_sub = df_sub.sort_values(by='valor', ascending=False)
 
-                fig_sub = px.bar(
-                    df_sub, x='valor_abs', y='subcategoria',
-                    orientation='h', text_auto=',.2f',
-                    template="plotly_dark"
-                )
-                # AJUSTE: Margens e responsividade do gráfico de barras
+                fig_sub = px.bar(df_sub, x='valor', y='subcategoria', orientation='h', text_auto=',.2f',
+                                 template="plotly_dark")
                 fig_sub.update_layout(margin=dict(l=10, r=10, t=30, b=10))
-                st.plotly_chart(fig_sub, use_container_width=True, config={'displayModeBar': False})
+                st.plotly_chart(fig_sub, width='stretch', config={'displayModeBar': False})
 
         with aba2:
             st.markdown("### 📊 Comparativo  \n<small>Evolução Mensal</small>", unsafe_allow_html=True)
-            df_mensal = df[df['tipo'] == 'Gasto'].copy()
+            df_mensal = df[df['tipo'].str.lower().isin(['gasto', 'despesa'])].copy()
             df_mensal['valor_abs'] = df_mensal['valor'].abs()
-
-            # Simplificamos a visualização de data para o gráfico
             df_mensal['mes_ref'] = df_mensal['data'].dt.strftime('%m/%y')
 
-            cat_comp = st.radio("Comparar por:", ["Geral", "Conta", "Grupo"], horizontal=True)
+            cat_comp = st.radio("Comparar por:", ["Geral", "Conta", "Grupo"], horizontal=True, key="rad_comparativo")
 
             if cat_comp == "Geral":
                 resumo_m = df_mensal.groupby('mes_ref')['valor_abs'].sum().reset_index()
@@ -463,171 +547,124 @@ def render_dashboard():
                 fig_m = px.bar(resumo_m, x='mes_ref', y='valor_abs', color=col_nome, barmode='group',
                                template="plotly_dark")
 
-            # AJUSTE: Legenda horizontal para não espremer o gráfico no iPhone
-            fig_m.update_layout(
-                margin=dict(l=10, r=10, t=30, b=10),
-                legend=dict(orientation="h", y=-0.3, x=0.5, xanchor="center")
-            )
-            st.plotly_chart(fig_m, use_container_width=True, config={'displayModeBar': False})
+            fig_m.update_layout(margin=dict(l=10, r=10, t=30, b=10),
+                                legend=dict(orientation="h", y=-0.3, x=0.5, xanchor="center"))
+            st.plotly_chart(fig_m, width='stretch', config={'displayModeBar': False})
 
         with aba3:
             st.markdown(f"### 📋 Lançamentos  \n<small>Lista Completa de {mes_sel}</small>", unsafe_allow_html=True)
-            # AJUSTE: Ordenação e largura total
-            st.dataframe(
-                df_mes.sort_values(by='data', ascending=False),
-                use_container_width=True,
-                hide_index=True
-            )
+            st.dataframe(df_mes.sort_values(by='data', ascending=False), width='stretch', hide_index=True)
 
-    with aba_inv:
-        st.subheader("Minha Carteira")
-        df_inv = carregar_investimentos_usuario(usuario_atual)
+        # --- ABA DE INVESTIMENTOS ---
+        with aba_inv:
+            st.subheader("📈 Minha Carteira de Ativos")
+            # INTEGRAÇÃO SUPABASE: Substitui a consulta local
+            df_inv = carregar_investimentos_usuario(usuario_atual)
 
-        if not df_inv.empty:
-            # 1. BUSCA DE PREÇOS (Yahoo Finance) com Spinner para feedback no mobile
-            tickers_unicos = df_inv['ativo'].unique().tolist()
-            precos_atuais = {}
+            if not df_inv.empty:
+                tickers_unicos = df_inv['ativo'].unique().tolist()
+                precos_atuais = {}
 
-            with st.spinner('Atualizando cotações...'):
-                for ticker in tickers_unicos:
-                    try:
-                        t_yf = ticker.strip().upper()
-                        if not t_yf.endswith(".SA") and len(t_yf) <= 6:
-                            t_yf += ".SA"
-                        papel = yf.Ticker(t_yf)
-                        # fast_info é melhor para mobile por ser mais leve
-                        precos_atuais[ticker] = papel.fast_info['last_price']
-                    except:
-                        precos_atuais[ticker] = 0.0
+                with st.spinner('🔄 Atualizando cotações via Yahoo Finance...'):
+                    for ticker in tickers_unicos:
+                        try:
+                            t_yf = ticker.strip().upper()
+                            if not t_yf.endswith(".SA"): t_yf += ".SA"
+                            papel = yf.Ticker(t_yf)
+                            # Tentativa fast_info ou regularMarketPrice
+                            preco = papel.fast_info.get('last_price') or papel.history(period="1d")['Close'].iloc[-1]
+                            precos_atuais[ticker] = float(preco)
+                        except:
+                            precos_atuais[ticker] = 0.0
 
-            # 2. CÁLCULOS
-            df_inv['Preço Atual'] = df_inv['ativo'].map(precos_atuais)
-            df_inv['Valor Total'] = df_inv['qtd_total'] * df_inv['Preço Atual']
-            df_inv['Performance'] = df_inv['Preço Atual'] - df_inv['preco_medio']
+                df_inv['Preço Atual'] = df_inv['ativo'].map(precos_atuais)
+                df_inv['Valor Total'] = df_inv['qtd_total'] * df_inv['Preço Atual']
+                df_inv['Performance'] = df_inv['Preço Atual'] - df_inv['preco_medio']
+                df_inv['Tendência'] = df_inv['Performance'].apply(
+                    lambda x: "▲ Alta" if x > 0 else ("▼ Baixa" if x < 0 else "▬ Estável"))
 
-            def definir_indicador(row):
-                if row['Performance'] > 0:
-                    return "▲ Alta"
-                elif row['Performance'] < 0:
-                    return "▼ Baixa"
-                return "▬ Estável"
+                st.dataframe(
+                    df_inv,
+                    column_config={
+                        "ativo": "Ativo",
+                        "Preço Atual": st.column_config.NumberColumn("Preço", format="R$ %.2f"),
+                        "Valor Total": st.column_config.NumberColumn("Total", format="R$ %.2f"),
+                        "preco_medio": st.column_config.NumberColumn("Médio", format="R$ %.2f"),
+                        "Performance": st.column_config.NumberColumn("Perf.", format="R$ %.2f"),
+                    },
+                    hide_index=True, width="stretch"
+                )
 
-            df_inv['Tendência'] = df_inv.apply(definir_indicador, axis=1)
+                st.divider()
+                with st.expander("📈 Detalhar Evolução Patrimonial", expanded=False):
+                    st.markdown("### 📈 Comparativo de Ativos")
 
-            # --- EXIBIÇÃO ---
-            st.markdown("### 📊 Meus Ativos  \n<small>Detalhamento da Carteira</small>", unsafe_allow_html=True)
+                    # INTEGRAÇÃO SUPABASE: Busca transações históricas do banco na nuvem
+                    df_trans = carregar_transacoes_invest(usuario_atual)
 
-            # AJUSTE PARA IPHONE: Tabela com largura total e colunas otimizadas
-            st.dataframe(
-                df_inv,
-                column_config={
-                    "ativo": "Ativo",
-                    "Preço Atual": st.column_config.NumberColumn("Preço", format="R$ %.2f"),
-                    "Valor Total": st.column_config.NumberColumn("Total", format="R$ %.2f"),
-                    "preco_medio": st.column_config.NumberColumn("Médio", format="R$ %.2f"),
-                    "Tendência": "Ref.",
-                    "Performance": st.column_config.NumberColumn("Perf.", format="R$ %.2f"),
-                },
-                hide_index=True,
-                use_container_width=True  # Essencial para não quebrar o layout lateral
-            )
+                    if df_trans.empty:
+                        st.info("Adicione transações no Supabase para visualizar a evolução.")
+                    else:
+                        tickers_disponiveis = sorted(df_trans['ativo'].unique().tolist())
+                        c_f1, c_f2 = st.columns([2, 1])
+                        with c_f1:
+                            ativos_selecionados = st.multiselect("Ativos:", options=tickers_disponiveis,
+                                                                 default=tickers_disponiveis)
+                        with c_f2:
+                            data_min = pd.to_datetime(df_trans['data']).min().date()
+                            inicio = st.date_input("Início", data_min, key="inv_ini")
+                            fim = st.date_input("Fim", datetime.now().date(), key="inv_fim")
 
-            # --- GRÁFICO DE PIZZA (Responsivo) ---
-            st.divider()
-            with st.expander("📈 Detalhar Evolução Patrimonial", expanded=False):
-                st.markdown("### 📈 Comparativo  \n<small>Análise de Evolução de Ativos</small>", unsafe_allow_html=True)
-
-                caminho_db = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'financas.db')
-                con = duckdb.connect(caminho_db)
-                df_trans = con.execute("SELECT * FROM transacoes_invest WHERE usuario_id = ? ORDER BY data",
-                                       [usuario_atual]).df()
-                con.close()
-
-                if df_trans.empty:
-                    st.info("Adicione transações para visualizar a evolução.")
-                else:
-                    tickers_disponiveis = sorted(df_trans['ativo'].unique().tolist())
-
-                    col_f1, col_f2 = st.columns([2, 1])
-                    with col_f1:
-                        ativos_selecionados = st.multiselect(
-                            "Selecione os Ativos:",
-                            options=tickers_disponiveis,
-                            default=tickers_disponiveis
-                        )
-                    with col_f2:
-                        data_min_base = pd.to_datetime(df_trans['data']).min().date()
-                        inicio = st.date_input("Início", data_min_base, key="ev_ini")
-                        fim = st.date_input("Fim", datetime.now().date(), key="ev_fim")
-
-                    # Botão com largura total para facilitar o toque no iPhone
-                    if st.button("🚀 Gerar Análise Detalhada", use_container_width=True):
-                        if not ativos_selecionados:
-                            st.warning("Selecione pelo menos um ativo.")
-                        else:
-                            with st.spinner("Buscando dados históricos..."):
+                        if st.button("🚀 Gerar Análise Detalhada", width="stretch"):
+                            with st.spinner("Buscando dados históricos e calculando posições..."):
                                 date_range = pd.date_range(start=inicio, end=fim)
                                 df_master = pd.DataFrame({'Data': date_range.date})
                                 df_master['Total_Somado'] = 0.0
-
-                                # SOLUÇÃO DO NameError: Inicializamos a figura ANTES do loop
                                 fig_evol = go.Figure()
 
                                 for t in ativos_selecionados:
                                     t_yf = t.strip().upper()
-                                    if not t_yf.endswith(".SA") and len(t_yf) <= 6:
-                                        t_yf += ".SA"
-
+                                    if not t_yf.endswith(".SA"): t_yf += ".SA"
                                     try:
                                         hist = yf.download(t_yf, start=inicio, end=fim + timedelta(days=1),
                                                            progress=False)
                                         if not hist.empty:
+                                            # Tratamento para colunas multinível do yfinance novo
+                                            if isinstance(hist.columns, pd.MultiIndex):
+                                                hist.columns = hist.columns.get_level_values(0)
+
                                             hist = hist.reset_index()
-                                            # Ajuste para garantir que 'Date' seja acessível (depende da versão do yfinance)
-                                            if 'Date' in hist.columns:
-                                                hist['Date'] = hist['Date'].dt.date
-                                                hist = hist[['Date', 'Close']].copy()
-                                                hist.columns = ['Data', 'Preco']
+                                            hist['Date'] = hist['Date'].dt.date
+                                            hist = hist[['Date', 'Close']].rename(
+                                                columns={'Date': 'Data', 'Close': 'Preco'})
 
-                                                df_ticker = pd.merge(pd.DataFrame({'Data': date_range.date}), hist,
-                                                                     on='Data', how='left')
-                                                df_ticker['Preco'] = df_ticker['Preco'].ffill().bfill()
+                                            df_ticker = pd.merge(pd.DataFrame({'Data': date_range.date}), hist,
+                                                                 on='Data', how='left')
+                                            df_ticker['Preco'] = df_ticker['Preco'].ffill().bfill()
 
-                                                valores_ativo = []
-                                                for idx, row in df_ticker.iterrows():
-                                                    data_ref = row['Data']
-                                                    trans_ate_data = df_trans[(df_trans['ativo'] == t) & (
-                                                                pd.to_datetime(df_trans['data']).dt.date <= data_ref)]
-                                                    qtd_acum = trans_ate_data.apply(lambda x: x['quantidade'] if x[
-                                                                                                                     'tipo_operacao'] == 'Compra' else -
-                                                    x['quantidade'], axis=1).sum()
-                                                    valor_no_dia = (
-                                                                qtd_acum * float(row['Preco'])) if qtd_acum > 0 else 0
-                                                    valores_ativo.append(valor_no_dia)
+                                            # LÓGICA DE QTD ACUMULADA (Mantida 100%)
+                                            valores_ativo = []
+                                            for data_ref in df_ticker['Data']:
+                                                trans_ate_data = df_trans[(df_trans['ativo'] == t) & (
+                                                            pd.to_datetime(df_trans['data']).dt.date <= data_ref)]
+                                                # Compra soma, Venda subtrai
+                                                qtd_acum = trans_ate_data.apply(lambda x: x['quantidade'] if x[
+                                                                                                                 'tipo_operacao'].lower() == 'compra' else -
+                                                x['quantidade'], axis=1).sum()
+                                                valores_ativo.append(qtd_acum * float(
+                                                    df_ticker.loc[df_ticker['Data'] == data_ref, 'Preco'].values[0]))
 
-                                                fig_evol.add_trace(go.Scatter(
-                                                    x=df_ticker['Data'], y=valores_ativo, mode='lines',
-                                                    name=f"{t}",
-                                                    visible='legendonly' if len(ativos_selecionados) > 1 else True
-                                                ))
-                                                df_master['Total_Somado'] += valores_ativo
-                                    except Exception:
+                                            fig_evol.add_trace(
+                                                go.Scatter(x=df_ticker['Data'], y=valores_ativo, mode='lines',
+                                                           name=f"{t}"))
+                                            df_master['Total_Somado'] += valores_ativo
+                                    except:
                                         continue
 
-                                # Linha do Patrimônio Total
-                                fig_evol.add_trace(go.Scatter(
-                                    x=df_master['Data'], y=df_master['Total_Somado'], fill='tozeroy',
-                                    line=dict(color='#00FFCC', width=4), name="Patrimônio Total"
-                                ))
-
-                                # SOLUÇÃO DO NameError e Layout Mobile
-                                fig_evol.update_layout(
-                                    template="plotly_dark",
-                                    title="Evolução do Patrimônio (R$)",
-                                    hovermode="x unified",
-                                    margin=dict(l=10, r=10, t=40, b=10),
-                                    legend=dict(orientation="h", y=-0.3, x=0.5, xanchor="center")
-                                )
-
-                                # SOLUÇÃO DO width='stretch': Usando use_container_width=True
-                                st.plotly_chart(fig_evol, use_container_width=True, config={'displayModeBar': False})
+                                fig_evol.add_trace(
+                                    go.Scatter(x=df_master['Data'], y=df_master['Total_Somado'], fill='tozeroy',
+                                               line=dict(color='#00FFCC', width=4), name="Total Carteira"))
+                                fig_evol.update_layout(template="plotly_dark", hovermode="x unified",
+                                                       margin=dict(l=10, r=10, t=40, b=10),
+                                                       legend=dict(orientation="h", y=-0.3, x=0.5, xanchor="center"))
+                                st.plotly_chart(fig_evol, width="stretch", config={'displayModeBar': False})

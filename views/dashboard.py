@@ -152,13 +152,17 @@ def render_dashboard():
         if not df_gastos_graf.empty:
             st.write("### 🔲 Mapa de Gastos (Treemap)")
 
-            # O Treemap agrupa por Grupo > Subgrupo > Subcategoria
+            # 1. Tratamento para evitar o erro 'Non-leaves rows are not permitted'
+            df_treemap = df_gastos_graf.copy()
+            df_treemap['grupo'] = df_treemap['grupo'].fillna("A Categorizar").replace("", "A Categorizar")
+            df_treemap['subgrupo'] = df_treemap['subgrupo'].fillna("A Categorizar").replace("", "A Categorizar")
+            df_treemap['subcategoria'] = df_treemap['subcategoria'].fillna("A Categorizar").replace("", "A Categorizar")
+
+            # 2. Criação da figura do gráfico usando o df_treemap tratado
             fig_tree = px.treemap(
-                df_gastos_graf,
+                df_treemap,
                 path=['grupo', 'subgrupo', 'subcategoria'],
                 values='valor_abs',
-                color='grupo',
-                template=tmpl  # Usa o tema (dark/light) definido no início do dashboard
             )
 
             # --- AJUSTE DEFINITIVO PARA VISUALIZAÇÃO NO IPHONE ---
@@ -184,7 +188,7 @@ def render_dashboard():
                 )
             )
 
-            # Renderização otimizada (sem a barra de ferramentas que atrapalha no mobile)
+            # Renderização ÚNICA otimizada (sem a barra de ferramentas que atrapalha no mobile)
             st.plotly_chart(
                 fig_tree,
                 width='stretch',

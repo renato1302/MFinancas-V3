@@ -11,8 +11,14 @@ from services.inteligencia import treinar_sistema, buscar_base_aprendizado, suge
 def render_lancamentos():
     st.header("📝 Gestão de Lançamentos")
 
+    # 🔍 LINHA DE DIAGNÓSTICO (mostra na tela quais chaves existem na sessão):
+    st.sidebar.write("Chaves na sessão:", list(st.session_state.keys()))
+
     # 1. Recupera o usuário logado na sessão (Essencial para o Supabase)
     usuario_atual = st.session_state.get('username')
+
+    from services.inteligencia import obter_uuid_usuario
+    usuario_uuid = obter_uuid_usuario()
 
     # 2. BUSCA MULTI-USUÁRIO: Traz tanto a estrutura padrão (admin) quanto a do próprio usuário
     df_contas_admin = buscar_contas("admin")  # Garanta que seu usuário admin principal se chama exatamente "admin"
@@ -158,7 +164,7 @@ def render_lancamentos():
                                         sucesso_geral = False
 
                             if sucesso_geral:
-                                treinar_sistema(transacoes_salvas, usuario_atual)
+                                treinar_sistema(transacoes_salvas, None)
                                 st.success("✅ Nota desmembrada com sucesso no Supabase!")
                                 st.rerun()
                         except Exception as e:
@@ -217,7 +223,8 @@ def render_lancamentos():
                                 }
 
                                 if inserir_transacao(dados_simples):
-                                    treinar_sistema([dados_simples], usuario_atual)
+                                    user_uuid = st.session_state.get('user_id') or st.session_state.get('usuario_id')
+                                    treinar_sistema([dados_simples], user_uuid)
                                     st.success("✅ Lançamento registrado no Supabase!")
                                     st.rerun()
                         except Exception as e:
@@ -288,7 +295,7 @@ def render_lancamentos():
                         df_completo = df_completo.dropna(subset=[sel_col_val])
                         df_completo = df_completo[df_completo[sel_col_val] != 0]
 
-                        base_aprendizado = buscar_base_aprendizado(usuario_atual)
+                        base_aprendizado = buscar_base_aprendizado(st.session_state.get('user_id'))
 
                         # Baixa os dados existentes do banco para checar duplicidade em memória de forma ultra veloz
                         df_existente = carregar_dados(usuario_atual)
@@ -392,11 +399,11 @@ def render_lancamentos():
                         "Descrição": st.column_config.TextColumn("Descrição", disabled=True),
                         "Valor (R$)": st.column_config.NumberColumn("Valor (R$)", disabled=True, format="%.2f"),
                         "Tipo": st.column_config.SelectboxColumn("Tipo", options=["Gasto", "Ganho"], width="small"),
-                        "Grupo": st.column_config.SelectboxColumn("Grupo", options=grupos_cadastrados, required=True),
+                        "Grupo": st.column_config.SelectboxColumn("Grupo", options=grupos_cadastrados, required=False),
                         "Subgrupo": st.column_config.SelectboxColumn("Subgrupo", options=subgrupos_cadastrados,
-                                                                     required=True),
+                                                                     required=False),
                         "Subcategoria": st.column_config.SelectboxColumn("Subcategoria", options=subcat_cadastradas,
-                                                                         required=True)
+                                                                         required=False)
                     },
                     key="editor_importacao_final"
                 )
@@ -420,8 +427,21 @@ def render_lancamentos():
                         transacoes_para_salvar = []
                         validacao_ok = True
 
-                        # VALIDAÇÃO DE INTEGRIDADE FLEXÍVEL (SUPORTA 2 NÍVEIS PARA RECEITAS / GANHOS)
+                        # VALIDAÇÃO DE INTEGRIDADE FLEXÍVEL (SUPORTA CAMPOS EM BRANCO E "A CATEGORIZAR")
                         for idx, row in df_para_salvar.iterrows():
+                            # Limpa os textos para checar se estão vazios ou com "A Categorizar"
+                            g_str = "" if pd.isna(row["Grupo"]) else str(row["Grupo"]).strip()
+                            sg_str = "" if pd.isna(row["Subgrupo"]) else str(row["Subgrupo"]).strip()
+                            cat_str = "" if pd.isna(row["Subcategoria"]) else str(row["Subcategoria"]).strip()
+
+                            # Pula a validação se estiver em branco OU se for "A Categorizar"
+                            ignorar_grupo = g_str in ["", "A Categorizar", "None"]
+                            ignorar_subgrupo = sg_str in ["", "A Categorizar", "None"]
+                            ignorar_subcat = cat_str in ["", "A Categorizar", "None"]
+
+                            if ignorar_grupo or ignorar_subgrupo or (row["Tipo"] == "Gasto" and ignorar_subcat):
+                                continue
+
                             if row["Tipo"] == "Ganho":
                                 # Se for Ganho, valida se a hierarquia Pai (Grupo e Subgrupo) existe junta
                                 relacao_valida = df_cats[
@@ -450,12 +470,29 @@ def render_lancamentos():
                                     valor_real = -abs(row["Valor (R$)"]) if row["Tipo"] == "Gasto" else abs(
                                         row["Valor (R$)"])
 
+                                    # --- TRATAMENTO DOS CAMPOS ANTES DE MANDAR PRO BANCO ---
+                                    # Se for vazio ou "A Categorizar", envia None (NULL no Supabase)
+                                    g_envio = None if (pd.isna(row["Grupo"]) or str(row["Grupo"]).strip() in ["",
+                                                                                                              "A Categorizar"]) else \
+                                    row["Grupo"]
+                                    sg_envio = None if (pd.isna(row["Subgrupo"]) or str(row["Subgrupo"]).strip() in ["",
+                                                                                                                     "A Categorizar"]) else \
+                                    row["Subgrupo"]
+
+                                    if row["Tipo"] == "Gasto":
+                                        subcat_envio = None if (pd.isna(row["Subcategoria"]) or str(
+                                            row["Subcategoria"]).strip() in ["", "A Categorizar"]) else row[
+                                            "Subcategoria"]
+                                    else:
+                                        subcat_envio = "Padrão"
+
+                                    # Monta o dicionário usando os valores já limpos/tratados acima
                                     dados_lanc = {
                                         "valor": valor_real,
                                         "tipo": row["Tipo"],
-                                        "grupo": row["Grupo"],
-                                        "subgrupo": row["Subgrupo"],
-                                        "subcategoria": row["Subcategoria"] if row["Tipo"] == "Gasto" else "Padrão",
+                                        "grupo": g_envio,
+                                        "subgrupo": sg_envio,
+                                        "subcategoria": subcat_envio,
                                         "conta": import_conta_sel,
                                         "data": row["Data"],
                                         "descricao": row["Descrição"],
@@ -469,7 +506,7 @@ def render_lancamentos():
 
                             if sucesso_importacao:
                                 # Ensina a IA com os dados revisados e inseridos com sucesso
-                                treinar_sistema(transacoes_para_salvar, usuario_atual)
+                                treinar_sistema(transacoes_para_salvar, None)
 
                                 st.success(
                                     f"✅ Sucesso! {len(transacoes_para_salvar)} lançamentos importados e a inteligência foi treinada.")
@@ -634,7 +671,8 @@ def render_lancamentos():
 
                     if sucesso_update:
                         # Alimenta a Inteligência Artificial com o lote que foi salvo
-                        treinar_sistema(dados_para_treino, usuario_atual)
+                        # ✅ CORREÇÃO: Tenta pegar o UUID do usuário de várias chaves comuns da sessão
+                        treinar_sistema(dados_para_treino, None)
                         st.success(
                             f"✅ {len(dados_para_treino)} lançamentos atualizados e Inteligência Artificial re-treinada com sucesso!")
                         st.rerun()
@@ -728,7 +766,7 @@ def render_lancamentos():
                                     "subgrupo": novo_subgrupo,
                                     "subcategoria": nova_subcategoria if row['tipo'] == "Gasto" else "Padrão"
                                 }
-                                treinar_sistema([dados_treino_update], usuario_atual)
+                                treinar_sistema([dados_treino_update], None)
 
                                 st.success("✅ Atualizado com sucesso!")
                                 st.rerun()
