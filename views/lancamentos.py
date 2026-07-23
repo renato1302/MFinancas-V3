@@ -42,7 +42,7 @@ def render_lancamentos():
         return
 
     # 4. Controle de Permissões
-    pode_editar = st.session_state.get('role') in ["Administrador", "Consegue Ler e Lançamentos"]
+    pode_editar = st.session_state.get('role') in ["Administrador", "Usuário", "Consegue Ler e Lançamentos"]
 
     # Criamos abas para organizar a tela do celular sem que fique muito longa
     aba_manual, aba_importacao = st.tabs(["➕ Lançamento Manual", "📥 Importar Extrato (CSV)"])

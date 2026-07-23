@@ -1,5 +1,5 @@
 import streamlit as st
-from database import supabase  # Garanta que o objeto supabase configurado é importado aqui
+from database import supabase
 
 
 def render_auth():
@@ -18,7 +18,6 @@ def render_auth():
         if st.button("Entrar no Sistema", type="primary", width='stretch'):
             if email and senha:
                 try:
-                    # ✅ Chamada Nativa do Supabase Auth
                     resposta = supabase.auth.sign_in_with_password({
                         "email": email.strip(),
                         "password": senha
@@ -28,12 +27,13 @@ def render_auth():
                         user = resposta.user
                         metadata = user.user_metadata or {}
 
-                        # Armazena os dados do usuário autenticado na sessão do Streamlit
+                        # Armazena na sessão
                         st.session_state['logged_in'] = True
                         st.session_state['username'] = metadata.get('username', user.email)
+
+                        # Se não tiver nível definido, assume 'Usuário' por padrão
                         st.session_state['role'] = metadata.get('nivel', 'Usuário')
 
-                        # ✅ Salva o UUID REAL nativo gerado pelo Supabase Auth
                         st.session_state['usuario_id'] = user.id
                         st.session_state['user_id'] = user.id
 
@@ -41,7 +41,6 @@ def render_auth():
                         st.rerun()
 
                 except Exception as e:
-                    # Tratamento de erro amigável caso as credenciais estejam incorretas
                     st.error("❌ E-mail ou senha incorretos. Verifique seus dados.")
             else:
                 st.warning("⚠️ Preencha todos os campos.")
@@ -52,34 +51,35 @@ def render_auth():
         novo_user = st.text_input("Usuário", key="reg_user")
         novo_email = st.text_input("E-mail", key="reg_email")
         nova_senha = st.text_input("Senha (mínimo 6 caracteres)", type="password", key="reg_pass")
-        nivel = st.selectbox("Nível", ["Usuário", "Administrador"])
 
-        if st.button("Solicitar Acesso", width='stretch'):
+        # 🚨 REMOVIDO: O selectbox de Nível foi removido para evitar que o usuário escolha ser admin.
+
+        if st.button("Criar Conta", width='stretch'):
             if novo_user and nova_senha and novo_email:
                 if len(nova_senha) < 6:
                     st.warning("⚠️ A senha deve ter no mínimo 6 caracteres.")
                 else:
                     try:
-                        # ✅ Cadastro Nativo no Supabase Auth com Metadados
+                        # ✅ Cadastro Nativo: Força o nível 'Usuário' por padrão
                         resposta = supabase.auth.sign_up({
                             "email": novo_email.strip(),
                             "password": nova_senha,
                             "options": {
                                 "data": {
                                     "username": novo_user.strip(),
-                                    "nivel": nivel
+                                    "nivel": "Usuário"  # <-- Nível padrão automático
                                 }
                             }
                         })
 
                         if resposta.user:
-                            st.success("✅ Conta criada com sucesso! Você já pode acessar a aba 'Entrar'.")
+                            st.success("✅ Conta criada com sucesso! Você já pode entrar e utilizar o sistema.")
                     except Exception as e:
                         st.error(f"Erro ao criar conta: {e}")
             else:
                 st.warning("⚠️ Por favor, preencha todos os campos.")
 
-    # --- ABA 3: RECUPERAÇÃO DE SENHA NATIIVA VIA E-MAIL ---
+    # --- ABA 3: RECUPERAÇÃO DE SENHA ---
     with tab_recuperar:
         st.info("Informe seu e-mail para receber as instruções de redefinição de senha.")
         rec_email = st.text_input("E-mail Cadastrado", key="rec_email")
@@ -87,7 +87,6 @@ def render_auth():
         if st.button("Enviar E-mail de Recuperação", width='stretch'):
             if rec_email:
                 try:
-                    # ✅ Supabase envia e-mail seguro com token automaticamente
                     supabase.auth.reset_password_for_email(rec_email.strip())
                     st.success("✅ E-mail de recuperação enviado! Verifique sua caixa de entrada/spam.")
                 except Exception as e:
